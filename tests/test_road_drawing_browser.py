@@ -116,6 +116,7 @@ def test_freehand_reshape_cancel_and_save(live_app):
             const marker = G.roadNodes.getLayers().find(m => m.getLatLng().lat === lat && m.getLatLng().lng === lon);
             marker.fire('click', {originalEvent: {stopPropagation() {}}});
         }''')
+        page.wait_for_function('G.base.getLayers().some(g => g.getLayers && g.getLayers().length > 1)')
         assert not page.locator('.road-vertex').first.evaluate('(e) => e.classList.contains("leaflet-marker-draggable")')
         page.mouse.click(600, 400)
         page.wait_for_function('S.draw.pts.length === 2 && S.draw.pending.size === 0')

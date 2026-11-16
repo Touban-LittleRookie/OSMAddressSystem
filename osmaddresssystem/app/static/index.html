@@ -37,7 +37,7 @@
 </header>
 <nav id="tabs" aria-label="Workflow">
   <button data-tab="roads"><span class="step-n">1</span><span>Edit streets</span></button>
-  <button data-tab="ids"><span class="step-n">2</span><span>Street IDs</span></button>
+  <button data-tab="ids"><span class="step-n">2</span><span>Street types and IDs</span></button>
   <button data-tab="names"><span class="step-n">3</span><span>Street names</span></button>
   <button data-tab="addresses"><span class="step-n">4</span><span>Addresses</span></button>
   <span id="job" class="muted"></span>
@@ -45,7 +45,8 @@
 </nav>
 <main>
   <div id="map" aria-label="Community map"></div>
-  <details id="map-help"><summary data-i18n="Map guide">Map guide</summary><p data-i18n="Right-click a road for editing tools. Select a work area to review the map one section at a time.">Right-click a road for editing tools. Select a work area to review the map one section at a time.</p><div class="map-key"><span><i class="key-existing"></i><span data-i18n="Existing roads">Existing roads</span></span><span><i class="key-drawn"></i><span data-i18n="Added roads">Added roads</span></span><span><i class="key-review"></i><span data-i18n="Connection to review">Connection to review</span></span></div><p class="muted" data-i18n="Colours vary in the Street IDs and Street names tabs.">Colours vary in the Street IDs and Street names tabs.</p></details>
+  <div id="compute-status" role="status" aria-live="polite" hidden></div>
+  <details id="map-help"><summary data-i18n="Map guide">Map guide</summary><p data-i18n="Right-click a road for editing tools. Select a work area to review the map one section at a time.">Right-click a road for editing tools. Select a work area to review the map one section at a time.</p><div class="map-key"><span><i class="key-existing"></i><span data-i18n="Existing roads">Existing roads</span></span><span><i class="key-drawn"></i><span data-i18n="Added roads">Added roads</span></span><span><i class="key-review"></i><span data-i18n="Connection to review">Connection to review</span></span></div><p class="muted" data-i18n="Colours vary in the Street types and IDs and Street names tabs.">Colours vary in the Street types and IDs and Street names tabs.</p></details>
   <div id="banner" hidden></div>
   <div id="refbox" hidden></div>
   <div id="side">

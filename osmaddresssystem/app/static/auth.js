@@ -144,7 +144,7 @@ window.AuthUI=(()=>{
     guard('#ref-move,#ref-yes,#ref-other,[data-act=apply-settings],[data-restore]','admin');
     guard('#name-input,#nm,#ok,[data-act=set-name],[data-act=delete-name],[data-act=clear-name]','names');
     guard('.id-change,[data-act^=draw-],[data-act^=reshape-],[data-act^=cut-],[data-act^=del-],#roads-file,#areas-create,[data-road-action=reshape],[data-road-action=cut],[data-road-action=whole],[data-road-action=join],[data-road-action=extend]','geometry');
-    guard('.attr-edit,.pt-rank,#attrs-file','attributes');guard('[data-act=pick-access],[data-act=clear-access]','access');
+    guard('.attr-edit,.pt-rank,#attrs-file,#house-quartier,[data-act=set-quartier]','attributes');guard('[data-act=pick-access],[data-act=clear-access]','access');
     guard('#area-save','areas');guard('#recompute-now','compute');
   }
   let frame=0;

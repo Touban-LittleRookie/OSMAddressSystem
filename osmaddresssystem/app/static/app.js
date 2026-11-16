@@ -23,15 +23,31 @@ const user = () => '';
 
 /* ---------------------------------------------------------------- map */
 const map = L.map('map', { preferCanvas: true, maxZoom: 21 }).setView([5.3, 10.2], 13);
+let mapResizeFrame = null;
+new ResizeObserver(() => {
+  cancelAnimationFrame(mapResizeFrame);
+  mapResizeFrame = requestAnimationFrame(() => map.invalidateSize({ pan: false }));
+}).observe(document.getElementById('map'));
 map.on('dragstart zoomstart', () => { S.fitted = true; S.fittedRoads = true; });                // the user moved the map: it is theirs from now on
+/* the view (tab, map position, colours, work area) is remembered in this browser so a refresh comes back to it; unsaved drafts are not kept */
+const VIEW_KEY = 'addr-view:' + location.pathname;
+function savedView() { try { const v = JSON.parse(localStorage.getItem(VIEW_KEY) || 'null'); return v && Number.isFinite(v.lat) && Number.isFinite(v.lon) && Number.isFinite(v.zoom) ? v : null; } catch (e) { return null; } }
+function saveView() {
+  if (!S.ready) return;
+  const c = map.getCenter();
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify({ tab: S.tab, lat: c.lat, lon: c.lng, zoom: map.getZoom(), idColor: S.idColor, area: S.activeArea, quartier: S.activeQuartier })); } catch (e) { /* no storage */ }
+}
+map.on('moveend', saveView);
+window.addEventListener('pagehide', saveView);
 const hybrid = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 21, maxNativeZoom: 20, attribution: 'Imagery &copy; Google' }).addTo(map);
 const osmTiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 21, maxNativeZoom: 19, attribution: '&copy; OpenStreetMap' });
-L.control.layers({ Satellite: hybrid, OpenStreetMap: osmTiles }, {}, { position: 'topleft' }).addTo(map);
+const esriTiles = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 21, maxNativeZoom: 18, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' });
+L.control.layers({ Satellite: hybrid, 'Satellite (Esri)': esriTiles, OpenStreetMap: osmTiles }, {}, { position: 'topleft' }).addTo(map);
 /* opacity slider of the background map inside the layer control */
 (() => {
   const box = document.querySelector('.leaflet-control-layers-list'); if (!box) return;
   let v = 100; try { v = +(localStorage.getItem('addr-bg-opacity') || 100); } catch (e) { /* no storage */ }
-  const apply = (x) => { hybrid.setOpacity(x / 100); osmTiles.setOpacity(x / 100); const lbl = box.querySelector('.bg-op-val'); if (lbl) lbl.textContent = `${x}%`; };
+  const apply = (x) => { hybrid.setOpacity(x / 100); esriTiles.setOpacity(x / 100); osmTiles.setOpacity(x / 100); const lbl = box.querySelector('.bg-op-val'); if (lbl) lbl.textContent = `${x}%`; };
   const row = document.createElement('div'); row.className = 'bg-opacity';
   row.innerHTML = I18n.html`<label>Background opacity <span class="bg-op-val">${v}%</span></label><input type="range" min="0" max="100" step="5" value="${v}">`;
   box.appendChild(row);
@@ -40,52 +56,220 @@ L.control.layers({ Satellite: hybrid, OpenStreetMap: osmTiles }, {}, { position:
   apply(v);
 })();
 const G = {};
-['area', 'points', 'ref', 'base', 'net', 'cuts', 'labels', 'hl', 'roadEdges', 'roadNodes', 'houses', 'signs', 'access', 'junc', 'refnodes', 'refhover', 'outside'].forEach((k) => { G[k] = L.layerGroup(); });
-const TAB_LAYERS = ['outside', 'junc', 'base', 'net', 'cuts', 'labels', 'roadEdges', 'roadNodes', 'houses', 'signs', 'access'];
+['area', 'points', 'ref', 'base', 'net', 'cuts', 'labels', 'hl', 'roadEdges', 'roadNodes', 'houses', 'signs', 'access', 'junc', 'refnodes', 'refhover', 'outside', 'check'].forEach((k) => { G[k] = L.layerGroup(); });
+const TAB_LAYERS = ['check', 'outside', 'junc', 'base', 'net', 'cuts', 'labels', 'roadEdges', 'roadNodes', 'houses', 'signs', 'access'];
 const clearTab = () => { TAB_LAYERS.forEach((k) => { G[k].clearLayers(); map.removeLayer(G[k]); }); G.hl.clearLayers(); };
 map.createPane('workareas'); map.getPane('workareas').style.zIndex = 350;
+map.createPane('quartierhover'); map.getPane('quartierhover').style.zIndex = 355;
 const areaLayer = L.layerGroup().addTo(map);
+const quartierHoverLayer = L.layerGroup().addTo(map);
+const sharedBoundaryLayer = L.layerGroup().addTo(map);
+const boundaryLayer = L.layerGroup().addTo(map);
 const AREA_LABELS = { unreviewed: 'Not reviewed', in_progress: 'In progress', reviewed: 'Reviewed', needs_review: 'Needs review' };
 const AREA_COLORS = { unreviewed: '#78909c', in_progress: '#1976d2', reviewed: '#2e7d32', needs_review: '#ef6c00' };
-function activeWorkArea() { return S.project?.work_areas?.features?.find(f => f.properties.id === S.activeArea); }
-function inWorkArea(f) { const area = activeWorkArea(); return !area || L.geoJSON(f).getBounds().intersects(L.geoJSON(area).getBounds()); }
+const AREA_STAGES = {
+  geometry: ['Road geometry', ['not_started', 'in_progress', 'reviewed', 'needs_review']],
+  attributes: ['Street attributes', ['not_started', 'in_progress', 'reviewed', 'needs_review']],
+  names: ['Names', ['not_started', 'in_progress', 'waiting_for_community', 'complete', 'needs_review']],
+  buildings: ['Buildings', ['not_started', 'in_progress', 'reviewed', 'needs_review']],
+  addresses: ['Addresses', ['not_started', 'in_progress', 'needs_correction', 'verified']]
+};
+const STAGE_LABELS = { not_started: 'Not started', in_progress: 'In progress', reviewed: 'Reviewed', needs_review: 'Needs review',
+  waiting_for_community: 'Waiting for community', complete: 'Complete', needs_correction: 'Needs correction', verified: 'Verified' };
+function activeWorkArea() { return S.project?.work_areas?.kind === 'quartiers' ? null : S.project?.work_areas?.features?.find(f => f.properties.id === S.activeArea); }
+function quartierFeatures() { const areas = S.project?.work_areas; return areas?.quartiers?.features || (areas?.kind === 'quartiers' ? areas.features : []) || []; }
+function activeQuartier() { return quartierFeatures().find(f => f.properties.id === S.activeQuartier); }
+function highlightQuartiers(ids) {
+  quartierHoverLayer.clearLayers();
+  const wanted = new Set(ids);
+  const features = quartierFeatures().filter(f => wanted.has(f.properties.id));
+  if (!features.length) return;
+  L.geoJSON({ type: 'FeatureCollection', features }, { pane: 'quartierhover', interactive: false,
+    style: { color: '#ffb000', weight: 4, opacity: 1, fillColor: '#ffb000', fillOpacity: .14 }
+  }).addTo(quartierHoverLayer);
+}
+function clearQuartierHover() { quartierHoverLayer.clearLayers(); }
+function workAreaNumber(id) { const i = (S.project?.work_areas?.features || []).findIndex(f => f.properties.id === id); return i < 0 ? null : i + 1; }
+function workAreaRef(f) { const n = workAreaNumber(f.properties.id), p = f.properties; return `${n === null ? '' : n + '. '}${p.kind === 'quartier' ? p.name : p.id}`; }
+function areaStages(p) {
+  const result = Object.fromEntries(Object.keys(AREA_STAGES).map(k => [k, 'not_started']));
+  if (p.stages) Object.keys(result).forEach(k => { if (p.stages[k]) result[k] = p.stages[k]; });
+  else result.geometry = { in_progress: 'in_progress', reviewed: 'reviewed', needs_review: 'needs_review' }[p.status] || 'not_started';
+  return result;
+}
+function stageSelect(key, current) {
+  const [label, values] = AREA_STAGES[key];
+  return I18n.html`<label>${I18n.t(label)}<select data-area-stage="${key}">${values.map(v => I18n.html`<option value="${v}" ${current === v ? 'selected' : ''}>${I18n.t(STAGE_LABELS[v])}</option>`).join('')}</select></label>`;
+}
+function readFileBase64(file) { return new Promise((resolve, reject) => { const r = new FileReader(); r.onerror = () => reject(new Error('Could not read the CSV file')); r.onload = () => resolve(String(r.result).split(',', 2)[1]); r.readAsDataURL(file); }); }
+function inWorkArea(f) { const area = activeWorkArea() || activeQuartier(); return !area || L.geoJSON(f).getBounds().intersects(L.geoJSON(area).getBounds()); }
+function chooseQuartier(id) {
+  if (S.boundaryEdit) return;
+  S.areaView = 'quartiers'; S.activeQuartier = id || null; S.activeArea = null; S.boundaryOptions = null; S.areaBoxOpen = true;
+  const area = activeQuartier();
+  if (area) map.fitBounds(L.geoJSON(area).getBounds().pad(.05), { maxZoom: 17, animate: false });
+  renderWorkAreas(); if (S.tab === 'roads') drawTab();
+}
 function chooseWorkArea(id) {
-  S.activeArea = id || null;
+  if (S.check) { S.check = null; G.check.clearLayers(); }
+  if (S.boundaryEdit) return;
+  S.areaView = 'work'; S.activeArea = id || null; S.activeQuartier = null; S.areaBoxOpen = true;
   const area = activeWorkArea();
   if (area) map.fitBounds(L.geoJSON(area).getBounds().pad(.1), { maxZoom: 19, animate: false });
   renderWorkAreas(); if (S.tab === 'roads') drawTab();
 }
+function chooseAreaView(view) {
+  if (S.boundaryEdit) return;
+  S.areaView = ['whole', 'quartiers', 'work'].includes(view) ? view : 'whole';
+  S.activeArea = null; S.activeQuartier = null; S.boundaryOptions = null; S.areaBoxOpen = true;
+  renderWorkAreas(); if (S.tab === 'roads') drawTab();
+}
+function renderBoundaryDraft() {
+  boundaryLayer.clearLayers();
+  const d = S.boundaryEdit; if (!d) return;
+  L.polyline(d.original, { color: '#ef6c00', weight: 7, opacity: .55, dashArray: '7 6', interactive: false }).addTo(boundaryLayer);
+  L.polyline(d.pts, { color: '#00d7e8', weight: 5, opacity: 1, interactive: false }).addTo(boundaryLayer);
+  d.pts.forEach((point, index) => {
+    const fixed = index === 0 || index === d.pts.length - 1;
+    const marker = L.marker(point, { draggable: !fixed, icon: L.divIcon({ className: `road-vertex${fixed ? index === 0 ? ' road-start' : ' road-end' : ''}`, iconSize: [12, 12], iconAnchor: [6, 6] }) }).addTo(boundaryLayer);
+    marker.bindTooltip(fixed ? 'Fixed border junction' : 'Drag to adjust; right-click to remove');
+    if (!fixed) {
+      marker.on('dragend', event => { const p = event.target.getLatLng(); d.pts[index] = [p.lat, p.lng]; renderBoundaryDraft(); });
+      marker.on('contextmenu', event => { L.DomEvent.preventDefault(event); if (d.pts.length > 2) { d.pts.splice(index, 1); renderBoundaryDraft(); } });
+    }
+    if (index < d.pts.length - 1) {
+      const next = d.pts[index + 1], middle = [(point[0] + next[0]) / 2, (point[1] + next[1]) / 2];
+      L.marker(middle, { icon: L.divIcon({ className: 'road-midpoint', iconSize: [9, 9], iconAnchor: [4, 4] }) }).addTo(boundaryLayer)
+        .bindTooltip('Click to insert a border point').on('click', event => { L.DomEvent.stopPropagation(event); d.pts.splice(index + 1, 0, middle); renderBoundaryDraft(); });
+    }
+  });
+}
+function boundaryControls(area) {
+  if (!area || area.properties.kind !== 'quartier') return '';
+  if (S.boundaryEdit?.areaId === area.properties.id) return I18n.html`<div class="boundary-editor"><p><strong>Border with ${esc(S.boundaryEdit.neighbourName)}</strong></p>
+    <p class="muted">Move white points or insert intermediate points. Green and red endpoints stay fixed so neighbouring borders remain connected.</p>
+    <textarea id="boundary-reason" maxlength="500" placeholder="Field evidence and reason for this correction"></textarea>
+    <div class="row"><button id="boundary-save" class="primary">Save corrected border</button><button id="boundary-reset">Reset</button><button id="boundary-cancel">Cancel</button></div></div>`;
+  if (S.boundaryOptions?.area_id === area.properties.id) return S.boundaryOptions.neighbours.length ? I18n.html`<div class="boundary-editor"><label>Neighbouring quartier<select id="boundary-neighbour">${S.boundaryOptions.neighbours.map(n => I18n.html`<option value="${esc(n.id)}">${esc(n.name)} · ${fmt(n.length_m)} m</option>`).join('')}</select></label><button id="boundary-start">Adjust this shared border</button></div>` : I18n.html`<p class="muted">No editable neighbouring border was found.</p>`;
+  return I18n.html`<button id="boundary-load">Adjust a quartier border</button>`;
+}
 function renderWorkAreas() {
   const box = $('#workarea-box'); if (!box) return;
-  areaLayer.clearLayers();
+  areaLayer.clearLayers(); sharedBoundaryLayer.clearLayers(); clearQuartierHover();
   if (!S.project || S.locked) { box.hidden = true; return; }
   box.hidden = false;
-  const cells = S.project.work_areas?.features || [], area = activeWorkArea();
-  if (cells.length && S.showAreas !== false) {
-    L.geoJSON({ type: 'FeatureCollection', features: cells }, { pane: 'workareas',
-      style: f => ({ color: AREA_COLORS[f.properties.status], weight: f.properties.id === S.activeArea ? 4 : 1, fillOpacity: f.properties.id === S.activeArea ? .12 : .025 }),
-      onEachFeature: (f, layer) => { layer.bindTooltip(`${f.properties.id}: ${I18n.t(AREA_LABELS[f.properties.status])}`, { sticky: true });
-        layer.on('click', e => { if (S.mode || S.draw || S.cut) return; L.DomEvent.stopPropagation(e); chooseWorkArea(f.properties.id); }); }
+  const cells = S.project.work_areas?.kind === 'quartiers' ? [] : (S.project.work_areas?.features || []), area = activeWorkArea(), quartiers = quartierFeatures(), qArea = activeQuartier();
+  const visibleCells = cells, view = S.areaView || 'whole';
+  const showQuartiers = view === 'quartiers' || (view === 'work' && S.showQuartierBoundaries === true);
+  const showWorkAreas = view === 'work';
+  if (quartiers.length && showQuartiers) {
+    L.geoJSON({ type: 'FeatureCollection', features: quartiers }, { pane: 'workareas',
+      style: f => f.properties.id === S.activeQuartier
+        ? { color: '#ffb000', weight: 5, opacity: 1, fillColor: '#ffb000', fillOpacity: .06, className: 'quartier-selected' }
+        : { color: '#7e57c2', weight: 2.5, opacity: .82, fillOpacity: .012, dashArray: '10 5', className: 'quartier-boundary' },
+      onEachFeature: (f, layer) => { layer._areaKind = 'quartier'; layer._areaSelected = f.properties.id === S.activeQuartier; layer.bindTooltip(`${esc(f.properties.name)}${f.properties.code ? ' (' + esc(f.properties.code) + ')' : ''}`, { sticky: true });
+        layer.on('mouseover', () => { if (!S.boundaryEdit) highlightQuartiers([f.properties.id]); });
+        layer.on('mouseout', clearQuartierHover);
+        layer.on('click', e => { if (view !== 'quartiers' || S.mode || S.draw || S.cut || S.boundaryEdit) return; L.DomEvent.stopPropagation(e); chooseQuartier(f.properties.id); }); }
     }).addTo(areaLayer);
+    if (!S.boundaryEdit && S.sharedQuartierBoundaries?.features?.length) {
+      L.geoJSON(S.sharedQuartierBoundaries, { pane: 'quartierhover',
+        style: { color: '#ffb000', weight: 14, opacity: .001, lineCap: 'round' },
+        onEachFeature: (f, layer) => {
+          layer._sharedQuartierBoundary = true;
+          layer.bindTooltip(`${esc(f.properties.left_name)} \u2194 ${esc(f.properties.right_name)}`, { sticky: true, direction: 'top' });
+          layer.on('mouseover', () => { layer.setStyle({ weight: 7, opacity: 1 }); highlightQuartiers([f.properties.left_id, f.properties.right_id]); });
+          layer.on('mouseout', () => { layer.setStyle({ weight: 14, opacity: .001 }); clearQuartierHover(); });
+          layer.on('click', event => L.DomEvent.stopPropagation(event));
+        }
+      }).addTo(sharedBoundaryLayer);
+    }
   }
-  const counts = Object.entries(AREA_LABELS).map(([s, label]) => `${cells.filter(f => f.properties.status === s).length} ${I18n.t(label.toLowerCase())}`).join(' · ');
-  box.innerHTML = I18n.html`<details ${S.areaBoxOpen ? 'open' : ''}><summary>Work areas${area ? ' · ' + area.properties.id : ''}</summary>${cells.length ? I18n.html`
-    <p class="muted">${fmt(S.project.work_areas.cell_m)} m grid · ${counts}</p><label><input type="checkbox" id="areas-visible" ${S.showAreas !== false ? 'checked' : ''}> Show grid</label>
-    <select id="area-select"><option value="">Whole map</option>${cells.map(f => I18n.html`<option value="${f.properties.id}" ${f.properties.id === S.activeArea ? 'selected' : ''}>${f.properties.id} · ${I18n.t(AREA_LABELS[f.properties.status])}</option>`).join('')}</select>
-    ${area ? I18n.html`<label>Progress <select id="area-status">${Object.entries(AREA_LABELS).map(([s, label]) => I18n.html`<option value="${s}" ${area.properties.status === s ? 'selected' : ''}>${I18n.t(label)}</option>`).join('')}</select></label>
-      <textarea id="area-note" maxlength="2000" placeholder="What was checked? What is uncertain?">${esc(area.properties.note || '')}</textarea><button id="area-save">Save area progress</button>` : ''}
-    <p class="muted">Focus highlights an area and narrows road selection. Roads crossing its boundary stay whole. Progress is your review record, not automatic verification.</p>` : I18n.html`
-    <p>Divide this project's area into a review grid.</p><label>Cell size <select id="area-size"><option value="auto">Automatic</option>${[100,250,500,1000,2000].map(m=>I18n.html`<option value="${m}">${m} m</option>`).join('')}</select></label><button id="areas-create">Create work areas</button>`}</details>`;
+  if (visibleCells.length && showWorkAreas) {
+    L.geoJSON({ type: 'FeatureCollection', features: visibleCells }, { pane: 'workareas',
+      style: f => f.properties.id === S.activeArea
+        ? { color: '#00d7e8', weight: 5, opacity: 1, fillColor: '#00d7e8', fillOpacity: .09, className: 'work-area-selected' }
+        : { color: AREA_COLORS[f.properties.status] || AREA_COLORS.unreviewed, weight: 1.5, opacity: .72, fillOpacity: .018, dashArray: '5 6', className: 'work-area-grid' },
+      onEachFeature: (f, layer) => { layer._areaKind = 'work'; layer._areaSelected = f.properties.id === S.activeArea; layer.bindTooltip(`${esc(workAreaRef(f))}: ${I18n.t(AREA_LABELS[f.properties.status] || 'Not reviewed')}`, { sticky: true });
+        layer.on('click', e => { if (S.mode || S.draw || S.cut || S.boundaryEdit) return; L.DomEvent.stopPropagation(e); chooseWorkArea(f.properties.id); }); }
+    }).addTo(areaLayer);
+    if (area) {
+      const ref = esc(workAreaRef(area)), status = I18n.t(AREA_LABELS[area.properties.status] || 'Not reviewed');
+      L.marker(L.geoJSON(area).getBounds().getCenter(), { pane: 'workareas', interactive: false,
+        icon: L.divIcon({ className: 'work-area-focus-label', html: I18n.html`<strong>${ref}</strong><span>${status}</span>`, iconSize: [0, 0] })
+      }).addTo(areaLayer);
+    }
+  }
+  const counts = Object.entries(AREA_LABELS).map(([s, label]) => `${visibleCells.filter(f => f.properties.status === s).length} ${I18n.t(label.toLowerCase())}`).join(' · ');
+  const quartier = S.quartierImport, kind = S.project.work_areas?.kind;
+  const importReview = quartier?.preview ? I18n.html`<div class="quartier-review">
+    <p><strong>${fmt(quartier.preview.catalog?.with_points || 0)} approved quartiers with GPS points</strong> · ${fmt(quartier.preview.inside_rows)} records inside · ${fmt(quartier.preview.outside_rows)} outside</p>
+    <p class="muted">The supplied Fotouni catalogue determines the approved spelling, trigram and variants. Balassie is grouped under Lassié as confirmed.</p>
+    <div class="quartier-name-list">${quartier.preview.groups.map(g => I18n.html`<label class="${g.catalog_status === 'approved' ? '' : 'muted'}"><span>${esc(g.variants.map(v => `${v.name} (${v.count})`).join(' / '))}</span><input class="quartier-name" data-key="${esc(g.key)}" value="${esc(g.approved_name || 'Not in approved catalogue')}" readonly></label>`).join('')}</div>
+    ${quartier.preview.catalog?.without_points?.length ? I18n.html`<p class="muted"><strong>Approved quartiers without GPS observations:</strong> ${esc(quartier.preview.catalog.without_points.map(x => `${x.name} (${x.code})`).join(', '))}. Their approximate areas must be added during the live review.</p>` : ''}
+    <button id="quartiers-create">Create provisional quartier areas</button>
+    <p class="muted">This keeps the original work grid underneath the quartier level. The boundaries remain approximate.</p>
+  </div>` : '';
+  box.innerHTML = I18n.html`<details ${S.areaBoxOpen ? 'open' : ''}><summary>Work areas${qArea ? ' · ' + esc(qArea.properties.name) : ''}${area ? ' · ' + esc(workAreaRef(area)) : ''}</summary>
+    <p class="muted">${quartiers.length} quartiers · ${visibleCells.length} work areas</p>
+    <div class="area-view-modes" role="radiogroup" aria-label="Area view">
+      <label><span><input type="radio" name="area-view" value="whole" ${view === 'whole' ? 'checked' : ''}> Whole map</span><small>See everything</small></label>
+      <label><span><input type="radio" name="area-view" value="quartiers" ${view === 'quartiers' ? 'checked' : ''}> Quartiers</span><small>Choose a community area</small></label>
+      <label><span><input type="radio" name="area-view" value="work" ${view === 'work' ? 'checked' : ''}> Work areas</span><small>Review one small cell</small></label>
+    </div>
+    <p class="scope-path"><span>Whole map</span>${qArea ? I18n.html`<b>›</b><span>${esc(qArea.properties.name)}</span>` : ''}${area ? I18n.html`<b>›</b><span>${esc(area.properties.id)}</span>` : ''}</p>
+    ${view === 'whole' ? I18n.html`<div class="area-selection-card"><strong>Whole map</strong><p class="muted">The complete map is active. No quartier or work-area boundary is highlighted.</p></div>` : ''}
+    ${view === 'quartiers' ? I18n.html`<div class="area-selection-card">${quartiers.length ? I18n.html`<label>Choose a quartier<select id="quartier-select"><option value="">Choose...</option>${quartiers.map(f => I18n.html`<option value="${f.properties.id}" ${f.properties.id === S.activeQuartier ? 'selected' : ''}>${esc(f.properties.name)}${f.properties.code ? ` (${esc(f.properties.code)})` : ''}</option>`).join('')}</select></label>` : I18n.html`<p class="muted">No quartier has been generated yet.</p>`}
+      ${qArea ? I18n.html`<p><strong>${esc(qArea.properties.name)}</strong> ${qArea.properties.code ? I18n.html`<span class="badge">${esc(qArea.properties.code)}</span>` : ''} <span class="badge">Provisional</span></p><p class="muted">Recorded spellings: ${esc((qArea.properties.aliases || []).map(a => `${a.name} (${a.count})`).join(', ') || '-')}</p>${boundaryControls(qArea)}` : ''}
+      </div>` : ''}
+    ${view === 'work' ? I18n.html`<div class="area-selection-card"><label class="show-quartier-lines"><input type="checkbox" id="show-quartier-boundaries" ${S.showQuartierBoundaries === true ? 'checked' : ''}> Show quartier boundaries</label>
+      ${cells.length ? I18n.html`<label>Choose a work area<select id="area-select"><option value="">Choose...</option>${visibleCells.map(f => I18n.html`<option value="${f.properties.id}" ${f.properties.id === S.activeArea ? 'selected' : ''}>${esc(workAreaRef(f))}${f.properties.quartier_name ? ` · ${esc(f.properties.quartier_name)}` : ''} · ${I18n.t(AREA_LABELS[f.properties.status] || 'Not reviewed')}</option>`).join('')}</select></label>` : I18n.html`<p>Divide this project's area into smaller review cells.</p><label>Cell size <select id="area-size"><option value="auto">Automatic</option>${[100,250,500,1000,2000].map(m=>I18n.html`<option value="${m}">${m} m</option>`).join('')}</select></label><button id="areas-create">Create work areas</button>`}
+      <p class="muted">${counts}</p>
+      ${area ? I18n.html`
+      <details class="area-progress" ${S.areaProgressOpen ? 'open' : ''}><summary>Review progress · ${I18n.t(AREA_LABELS[area.properties.status] || 'Not reviewed')}</summary><div class="area-stage-grid">${Object.entries(areaStages(area.properties)).map(([k, v]) => stageSelect(k, v)).join('')}</div>
+      <textarea id="area-note" maxlength="2000" placeholder="What was checked? What is uncertain?">${esc(area.properties.note || '')}</textarea><button id="area-save">Save area progress</button></details>` : ''}</div>` : ''}
+    <details class="quartier-import area-advanced"><summary>Area setup (advanced)</summary><p>Select a CSV containing district, latitude and longitude. Only those three values are read.</p><input id="quartier-file" type="file" accept=".csv,text/csv"><button id="quartiers-preview">Preview quartiers</button>${importReview}</details>
+  </details>`;
   box.querySelector('details').ontoggle = e => { S.areaBoxOpen = e.target.open; };
+  const progress = box.querySelector('.area-progress'); if (progress) progress.ontoggle = e => { S.areaProgressOpen = e.target.open; };
 }
+document.addEventListener('change', (e) => { if (e.target && e.target.id === 'check-show-ok') { S.checkShowOk = e.target.checked; drawCheck(); renderPanel(); } });
 $('#workarea-box').addEventListener('change', e => {
+  if (e.target.name === 'area-view') chooseAreaView(e.target.value);
+  if (e.target.id === 'quartier-select') chooseQuartier(e.target.value);
   if (e.target.id === 'area-select') chooseWorkArea(e.target.value);
-  if (e.target.id === 'areas-visible') { S.showAreas = e.target.checked; renderWorkAreas(); }
+  if (e.target.id === 'show-quartier-boundaries') { S.showQuartierBoundaries = e.target.checked; renderWorkAreas(); }
 });
 $('#workarea-box').addEventListener('click', async e => {
   try {
     if (e.target.id === 'areas-create') { await api('/work-areas/grid', { cell_m: $('#area-size').value, revision: S.rev }); S.areaBoxOpen = true; await refreshProject(); }
-    if (e.target.id === 'area-save') { await api('/work-areas/status', { id: S.activeArea, status: $('#area-status').value, note: $('#area-note').value, revision: S.rev }); await refreshProject(); toast('Area progress saved'); }
+    if (e.target.id === 'area-save') { const stages = {}; document.querySelectorAll('[data-area-stage]').forEach(x => { stages[x.dataset.areaStage] = x.value; }); await api('/work-areas/status', { id: S.activeArea, stages, note: $('#area-note').value, revision: S.rev }); await refreshProject(); toast('Area progress saved'); }
+    if (e.target.id === 'boundary-load') { S.boundaryOptions = await api(`/work-areas/boundaries?area_id=${encodeURIComponent(S.activeQuartier)}`); renderWorkAreas(); }
+    if (e.target.id === 'boundary-start') {
+      const neighbour = S.boundaryOptions.neighbours.find(n => n.id === $('#boundary-neighbour').value);
+      S.boundaryEdit = { areaId: S.activeQuartier, neighbourId: neighbour.id, neighbourName: neighbour.name, revision: S.boundaryOptions.revision,
+        original: neighbour.geometry.coordinates.map(([lon, lat]) => [lat, lon]) };
+      S.boundaryEdit.pts = S.boundaryEdit.original.map(point => [...point]); renderWorkAreas(); renderBoundaryDraft();
+    }
+    if (e.target.id === 'boundary-reset') { S.boundaryEdit.pts = S.boundaryEdit.original.map(point => [...point]); renderBoundaryDraft(); }
+    if (e.target.id === 'boundary-cancel') { S.boundaryEdit = null; boundaryLayer.clearLayers(); renderWorkAreas(); }
+    if (e.target.id === 'boundary-save') {
+      const d = S.boundaryEdit, reason = $('#boundary-reason').value.trim();
+      await api('/work-areas/boundary', { area_id: d.areaId, neighbour_id: d.neighbourId, coords: d.pts.map(([lat, lon]) => [lon, lat]), reason, revision: d.revision });
+      S.boundaryEdit = null; S.boundaryOptions = null; boundaryLayer.clearLayers(); await refreshProject(); toast('Quartier border saved');
+    }
+    if (e.target.id === 'quartiers-preview') {
+      const file = $('#quartier-file').files[0]; if (!file) throw new Error('Choose a quartier CSV file first');
+      const content_b64 = await readFileBase64(file), preview = await api('/work-areas/quartiers/preview', { content_b64 });
+      S.quartierImport = { filename: file.name, content_b64, preview }; S.areaBoxOpen = true; renderWorkAreas();
+    }
+    if (e.target.id === 'quartiers-create') {
+      const mapping = {}; document.querySelectorAll('.quartier-name').forEach(x => { mapping[x.dataset.key] = x.value.trim(); });
+      const replace = quartierFeatures().length > 0;
+      if (replace && !window.confirm('Replace the current provisional quartier boundaries? The smaller work areas and their progress will be preserved.')) return;
+      await api('/work-areas/quartiers', { content_b64: S.quartierImport.content_b64, filename: S.quartierImport.filename, mapping, replace, revision: S.rev });
+      S.quartierImport = null; S.activeArea = null; S.activeQuartier = null; await refreshProject(); toast('Quartiers created above the existing work areas');
+    }
   } catch (error) { toast(error.message, 6000); }
 });
 const hueRaw = (id) => `hsl(${Math.round(((id * 0.61803398875) % 1) * 360)},70%,${id % 2 ? 45 : 38}%)`;
@@ -122,7 +306,7 @@ const STATUS = { named: '#2e7d32', derived: '#f9a825', derived2: '#ef6c00', plan
 const statusColor = (p) => (p.status === 'derived' && p.level === 2 ? STATUS.derived2 : STATUS[p.status] || STATUS.other);
 
 function toast(msg, ms = 2800) { const t = $('#toast'); t.textContent = I18n.t(msg); t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, ms); }
-function banner(text, mode) { const b = $('#banner'); if (!text) { b.hidden = true; return; } b.hidden = false; b.className = mode ? 'mode' : ''; b.innerHTML = esc(I18n.t(text)) + (mode && !S.locked ? I18n.htmlText(' <button id="banner-cancel">Cancel</button>') : ''); const c = $('#banner-cancel'); if (c) c.onclick = () => (S.draw ? stopDraw() : S.cut ? ACT['cut-cancel']() : setMode(null)); }
+function banner(text, mode) { const b = $('#banner'); if (!text) { b.hidden = true; return; } b.hidden = false; b.className = mode ? 'mode' : ''; b.innerHTML = esc(I18n.t(text)) + (mode && !S.locked ? I18n.htmlText(' <button id="banner-cancel">Cancel</button>') : ''); const c = $('#banner-cancel'); if (c) c.onclick = () => (S.edgeAccess ? ACT['edge-access-cancel']() : S.draw ? stopDraw() : S.cut ? ACT['cut-cancel']() : setMode(null)); }
 
 /* ---------------------------------------------------------------- project / header */
 function renderSaveState() {
@@ -131,11 +315,13 @@ function renderSaveState() {
 }
 async function refreshProject() {
   S.project = await api('/project');
+  try { S.sharedQuartierBoundaries = quartierFeatures().length ? await api('/work-areas/shared-boundaries') : null; }
+  catch (error) { S.sharedQuartierBoundaries = null; }
   const p = S.project, st = p.status;
   updateLock();
   $('#project-name').textContent = p.name + (p.version ? ` · v${p.version}` : '');
   renderSaveState();
-  if (S.rev !== undefined && S.rev !== st.revision) { S.baseStreets = null; S.refNodes = null; S.edgeData = null; S.rawBuildings = null; S.pointRanks = null; S.outsideNet = null; }      // anything edited: every cached layer is reloaded
+  if (S.rev !== undefined && S.rev !== st.revision) { S.baseStreets = null; S.components = null; S.refNodes = null; S.edgeData = null; S.rawBuildings = null; S.pointRanks = null; S.outsideNet = null; }      // anything edited: every cached layer is reloaded
   S.rev = st.revision; S.netHash = p.network_hash;
   $('#btn-undo').disabled = !st.can_undo; $('#btn-redo').disabled = !st.can_redo;
   $('#tabs').querySelectorAll('button').forEach((b) => { b.disabled = !p.reference && b.dataset.tab !== 'roads'; b.classList.toggle('active', b.dataset.tab === S.tab); });
@@ -191,6 +377,7 @@ function setMode(kind, data) {
   const text = { reference: 'Move over the map: the highlighted node is where the reference point goes. Click to choose it - the numbering starts from that node.',
                  access: I18n.msg`Click a road next to house ${data && data.id}: its number will be taken from that point.`,
                  connect: 'Click the existing road or node this end must connect to.',
+                 'edge-access': data && data.a ? 'Click B. Both points will snap to the nearest network node.' : 'Click A on or near a road. It will snap to the nearest network node.',
                  cut: 'Click two positions on the selected road. Only the red preview between them will be removed.', draw: '' }[kind];
   banner(kind && kind !== 'reference' ? text : '', !!kind);
   if (kind === 'reference') showRefNodes(); else hideRefNodes();
@@ -210,7 +397,7 @@ function nearestNode(ll) {
   for (const n of S.refNodes) { const dx = (n[1] - ll.lng) * k, dy = n[2] - ll.lat, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = n; } }
   return best;
 }
-map.on('dblclick', (e) => { if (S.draw && S.draw.mode !== 'reshape' && S.draw.mode !== 'route' && S.draw.tool === 'points' && !S.draw.saving && S.draw.pts.length >= 3) { S.draw.pts.pop(); S.draw.snaps.pop(); finishDraw(); } });
+map.on('dblclick', (e) => { if (S.draw && !isReshapeMode(S.draw) && S.draw.mode !== 'route' && S.draw.tool === 'points' && !S.draw.saving && S.draw.pts.length >= 3) { S.draw.pts.pop(); S.draw.snaps.pop(); finishDraw(); } });
 map.on('mousemove', (e) => {
   if (!S.mode || S.mode.kind !== 'reference') return;
   const n = nearestNode(e.latlng); S.hoverNode = n; G.refhover.clearLayers();
@@ -247,9 +434,17 @@ map.on('click', async (e) => {
       await api('/access', { building_id: data.id, lat: snap.lat, lon: snap.lon, user: user() });
       setMode(null); toast(`Road point set on street ${snap.street || snap.street_id}.`);
       await afterEdit(); drawTab();
+    } else if (kind === 'edge-access') {
+      if (!S.edgeAccess.a) {
+        S.edgeAccess.a = { lat: e.latlng.lat, lon: e.latlng.lng };
+        setMode('edge-access', { a: true }); renderPanel();
+      } else {
+        S.edgeAccess.result = await api('/edges/access/path', { a: S.edgeAccess.a, b: { lat: e.latlng.lat, lon: e.latlng.lng } });
+        S.edgeAccess.route = 0; setMode(null); drawTab();
+      }
     } else if (kind === 'cut') {
       await addCutPoint(e.latlng);
-    } else if (kind === 'draw' && S.draw && S.draw.mode !== 'reshape' && S.draw.tool === 'points') {
+    } else if (kind === 'draw' && S.draw && (!isReshapeMode(S.draw) || S.draw.mode === 'reshape-partial') && S.draw.tool === 'points') {
       await addDrawPoint(e.latlng);
     } else if (kind === 'connect') {
       if (S.stage) {
@@ -264,11 +459,71 @@ map.on('click', async (e) => {
   } catch (err) { toast(err.message, 4500); }
 });
 
-async function afterEdit() { await refreshProject(); }
+async function afterEdit() { await refreshProject(); if (S.check) runCheck(false); }
+
+/* ---------------------------------------------------------------- road check (gaps, overlaps, stubs, ends, skipped edits) */
+const CHECK_KINDS = {
+  skipped: ['Edits not applied', '#d50000'], gap: ['Gaps: an end stops close to a road', '#ff1744'],
+  overlap: ['Roads on top of each other', '#aa00ff'], crossing: ['Roads cross without a junction', '#ff9100'],
+  isolated: ['Not connected to the network', '#c51162'], stub: ['Very short sections', '#ffea00'],
+  free_end: ['Drawn road ends not connected', '#ff6d00'], drivable_unknown: ['Drivable not set', '#00b0ff'],
+};
+function checkText(i) {
+  if (i.kind === 'gap') return I18n.msg`${fmt(i.distance_m, 1)} m gap`;
+  if (i.kind === 'skipped') return I18n.msg`${I18n.t(i.what)} · edit ${(i.events || []).join(', ')}`;
+  if (i.kind === 'drivable_unknown') return I18n.msg`street ${i.street_id ?? '?'} · ${fmt(i.length_m, 0)} m`;
+  if (i.length_m !== undefined) return I18n.msg`${fmt(i.length_m, 1)} m`;
+  return I18n.msg`at ${i.lat.toFixed(5)}, ${i.lon.toFixed(5)}`;
+}
+async function runCheck(render = true) {
+  const area = S.activeArea || S.activeQuartier || '';
+  const r = await api('/roads/check' + (area ? `?area=${encodeURIComponent(area)}` : ''));
+  if ((r.area || '') !== (S.activeArea || S.activeQuartier || '')) return;            // the area changed meanwhile
+  S.check = r;
+  if (S.tab === 'roads') { drawCheck(); if (render || !S.draw) renderPanel(); }
+}
+function drawCheck() {
+  G.check.clearLayers();
+  if (!S.check) return;
+  S.check.issues.forEach((issue, n) => {
+    if (issue.ok && !S.checkShowOk) return;
+    const colour = (CHECK_KINDS[issue.kind] || ['', '#ff1744'])[1];
+    const layer = L.geoJSON(issue.geometry, { style: { color: colour, weight: issue.kind === 'drivable_unknown' ? 4 : 7, opacity: issue.ok ? .35 : .85, dashArray: issue.kind === 'drivable_unknown' ? '6 6' : null },
+      pointToLayer: (_f, ll) => L.circleMarker(ll, { radius: 9, color: '#000', weight: 2, fillColor: colour, fillOpacity: issue.ok ? .3 : .95 }) });
+    layer.bindTooltip(`${esc(I18n.t(CHECK_KINDS[issue.kind]?.[0] || issue.kind))}: ${esc(checkText(issue))}`, { sticky: true });
+    layer.on('click', (e) => { L.DomEvent.stopPropagation(e); zoomCheck(n); });
+    layer.addTo(G.check);
+  });
+  G.check.addTo(map);
+}
+function zoomCheck(n) {
+  const issue = S.check?.issues[n]; if (!issue) return;
+  S.checkFocus = issue.id;
+  const b = L.geoJSON(issue.geometry).getBounds();
+  if (b.isValid()) map.fitBounds(b.pad(1.5), { maxZoom: 20 }); else map.setView([issue.lat, issue.lon], 19);
+  G.hl.clearLayers(); L.geoJSON(issue.geometry, { style: { color: '#00e5ff', weight: 12, opacity: .5 }, pointToLayer: (_f, ll) => L.circleMarker(ll, { radius: 16, color: '#00e5ff', weight: 4, fill: false }), interactive: false }).addTo(G.hl); G.hl.addTo(map);
+  renderPanel();
+}
+function panelCheck() {
+  const area = activeWorkArea() || activeQuartier();
+  const where = area ? esc(workAreaRef(area)) : I18n.t('the whole map');
+  if (!S.check) return I18n.html`<p class="muted">${I18n.msg`Lists what to look at in ${where}: gaps, roads on top of each other, very short sections, unconnected ends, edits that do not apply. Nothing is changed by the check.`}</p><div class="row"><button class="primary" data-act="check-run">${I18n.msg`Check ${where}`}</button></div>`;
+  const groups = Object.keys(CHECK_KINDS).map((kind) => {
+    const rows = S.check.issues.map((i, n) => [i, n]).filter(([i]) => i.kind === kind && (!i.ok || S.checkShowOk));
+    if (!rows.length) return '';
+    const body = rows.map(([i, n]) => I18n.html`<tr class="click ${S.checkFocus === i.id ? 'sel' : ''}" data-act="check-zoom" data-n="${n}"><td>${n + 1}</td><td>${checkText(i)}</td><td>${i.ok
+      ? I18n.html`<button data-act="check-ok" data-id="${esc(i.id)}" data-ok="0">List again</button>` : I18n.html`<button data-act="check-ok" data-id="${esc(i.id)}" data-ok="1">OK as is</button>`}</td></tr>`).join('');
+    return I18n.html`<details ${kind !== 'drivable_unknown' ? 'open' : ''}><summary><span class="dot" style="background:${CHECK_KINDS[kind][1]}"></span> ${I18n.t(CHECK_KINDS[kind][0])} (${rows.filter(([i]) => !i.ok).length})</summary><table>${body}</table></details>`;
+  }).join('');
+  const left = Object.values(S.check.counts).reduce((a, b) => a + b, 0);
+  return I18n.html`<p>${left ? I18n.msg`${left} problems left in ${where}.` : I18n.msg`Nothing left to check in ${where}.`} <span class="muted">Click one to zoom to it.</span></p>
+    ${groups}
+    <div class="row"><button data-act="check-run">Check again</button>${S.check.ok ? I18n.html`<label><input type="checkbox" id="check-show-ok" ${S.checkShowOk ? 'checked' : ''}> ${I18n.msg`show the ${S.check.ok} marked OK`}</label>` : ''}<button data-act="check-close">Hide</button></div>`;
+}
 
 /* ---------------------------------------------------------------- compute */
-/* edits do not recompute the street ids by themselves (it takes a while): a bar offers it, and changing to Street IDs, Street names or Addresses recomputes
-   them when something changed; the Addresses tab then recomputes the addresses when it is opened */
+/* Edits do not recompute by themselves: switching workspace tabs is navigation only.  The stale bar and the address
+   panel provide explicit buttons, so geometry can be reviewed in batches without an expensive calculation per tab. */
 function recomputeIfStale() { const p = S.project; if (p && p.reference && S.refConfirmed && !S.polling && p.network_ready && p.stale) startCompute('network', true); }
 function updateStaleBar() {
   const p = S.project, bar = $('#stalebar'); if (!bar) return;
@@ -283,9 +538,6 @@ function autoCompute() {
   const atStart = !S.startChecked; S.startChecked = true;       // at the start of the map the ids are recomputed once when edits are waiting
   if (!p.network_ready || (atStart && p.stale)) {                // otherwise edits wait (see recomputeIfStale); one try per page load, never after every edit
     if (!S.autoNet) { S.autoNet = true; startCompute('network', true); }
-  } else if (!p.stale && S.tab === 'addresses' && (!p.addresses_ready || p.addresses_stale)) {
-    const key = `${p.status.revision}|${p.network_hash}`;
-    if (S.autoAddr !== key) { S.autoAddr = key; startCompute('addresses', true); }
   }
 }
 async function startCompute(kind, quiet = true) {
@@ -297,14 +549,32 @@ async function startCompute(kind, quiet = true) {
   } catch (e) { S.recomputing = false; updateStaleBar(); toast(e.message, 4500); return; }
   pollJob(kind);
 }
+function showComputeStatus(step, started = S.computeStartedAt) {
+  const box = $('#compute-status'); if (!box) return;
+  S.computeStartedAt = started || Date.now();
+  const elapsed = Math.max(0, Math.floor((Date.now() - S.computeStartedAt) / 1000));
+  box.hidden = false;
+  box.innerHTML = I18n.html`<span class="compute-spinner" aria-hidden="true"></span><strong>${esc(I18n.t(step || 'Updating the map'))}</strong><small>${elapsed} s · ${esc(I18n.t('The current map stays visible until the update is ready.'))}</small>`;
+}
+function hideComputeStatus() {
+  const box = $('#compute-status'); if (box) box.hidden = true;
+  S.computeStartedAt = null;
+}
 async function pollJob(kind) {
-  if (S.polling) return; S.polling = true;
+  if (S.polling) return; S.polling = true; S.computeStartedAt = Date.now();
+  const run = S.computeRun = (S.computeRun || 0) + 1;
+  showComputeStatus('Updating the map');
   const tick = async () => {
-    const j = await api('/job');
-    if (j.state === 'running') { $('#job').textContent = `computing: ${j.step}...`; setTimeout(tick, 600); return; }
+    let j;
+    try { j = await api('/job'); } catch (e) { $('#job').textContent = 'waiting for computation status...'; setTimeout(tick, 1000); return; }
+    if (j.state === 'running') { $('#job').textContent = `computing: ${j.step}...`; showComputeStatus(j.step); setTimeout(tick, 600); return; }
     S.polling = false; S.recomputing = false;
-    if (j.state === 'error') { toast(`Computation failed: ${j.error}`, 7000); await refreshProject(); return; }
-    if (j.state === 'done') { await loadComputed(j.kind || kind); }
+    if (j.state === 'error') { hideComputeStatus(); toast(`Computation failed: ${j.error}`, 7000); await refreshProject(); return; }
+    if (j.state === 'done') {
+      showComputeStatus('Loading the completed map');
+      await loadComputed(j.kind || kind);
+      if (S.computeRun === run && !S.polling) hideComputeStatus();
+    }
   };
   tick();
 }
@@ -313,9 +583,10 @@ async function loadComputed(kind) {
     if (kind === 'addresses') S.addresses = await api('/addresses');
     S.network = await api('/network');
     if (kind !== 'addresses') S.addresses = null;                     // the addresses follow the new street ids
-    await loadRoads();
+    await refreshProject();
+    await loadRoads(true);                                            // prepare every road layer before the old map is replaced
   } catch (e) { /* not available yet */ }
-  await refreshProject(); if (S.tab === 'addresses') S.addresses = S.addresses || null; drawTab();
+  if (S.tab === 'addresses') S.addresses = S.addresses || null; drawTab();
   if (kind === 'network' && S.network && S.mergeCheck) {
     const parts = S.network.streets.features.filter((f) => f.properties.original === S.mergeCheck.id).length;
     toast(parts > 1 ? `The street with id ${S.mergeCheck.id} was cut again into ${parts} parts at a minimum of the distance to the reference.` : `The street with id ${S.mergeCheck.id} is kept as one street.`, 6000); S.mergeCheck = null;
@@ -351,15 +622,12 @@ function focusWarning(w) {
 /* ---------------------------------------------------------------- tabs */
 async function switchTab(tab) {
   if (S.stage && tab !== 'roads' && !confirm('Cancel the new streets you are previewing?')) return;
-  const from = S.tab;
   if (S.draw && S.draw.preview) map.removeLayer(S.draw.preview);
-  S.tab = tab; S.sel = null; S.stage = null; S.del = null; S.reshapePick = null; S.cut = null; S.join = null; S.draw = null; map.dragging.enable(); map.doubleClickZoom.enable(); setMode(null); await refreshProject();
+  S.tab = tab; S.sel = null; S.stage = null; S.del = null; S.reshapePick = null; S.cut = null; S.join = null; S.draw = null; S.edgeAccess = null; map.dragging.enable(); map.doubleClickZoom.enable(); setMode(null); await refreshProject();
   if (tab === 'roads') await loadRoads();
   if ((tab === 'ids' || tab === 'names' || tab === 'addresses') && !S.network) { try { S.network = await api('/network'); } catch (e) { /* not computed */ } }
   if (tab === 'addresses' && !S.addresses) { try { S.addresses = await api('/addresses'); } catch (e) { /* not computed */ } }
   drawTab();
-  if (tab !== 'roads' && tab !== from) recomputeIfStale();         // leaving the street editor (or opening names / addresses) applies the edits
-  autoCompute();
 }
 $('#tabs').addEventListener('click', (e) => { const b = e.target.closest('button[data-tab]'); if (b && !b.disabled) switchTab(b.dataset.tab); });
 
@@ -375,8 +643,25 @@ function drawTab() {
   if (S.tab !== 'addresses' && S.project.has.points) G.points.addTo(map);
   const p = S.project;
   if (!p.reference) { drawReferencePick(); return; }
-  ({ roads: drawRoads, ids: drawNetwork, names: drawNetwork, addresses: drawAddresses }[S.tab])();
+  // Never draw an obsolete computed network over pending geometry: it can make an undone or reshaped road appear to
+  // have returned.  IDs/names are deliberately hidden until the user explicitly recomputes them.
+  if (p.stale && (S.tab === 'ids' || S.tab === 'names')) drawPendingRoadGeometry();
+  else ({ roads: drawRoads, ids: drawNetwork, names: drawNetwork, addresses: drawAddresses }[S.tab])();
+  if (S.edgeAccess) drawEdgeAccessDraft();
+  if (S.tab === 'roads') drawCheck();
   renderPanel();
+}
+function drawPendingRoadGeometry() {
+  const epoch = S.renderEpoch, tab = S.tab;
+  const paint = (fc) => {
+    if (epoch !== S.renderEpoch || S.tab !== tab || !S.project.stale) return;
+    G.base.clearLayers();
+    const features = (fc.features || []).filter(inWorkArea);
+    L.geoJSON({ type:'FeatureCollection', features }, { style:{ color:'#ffb300', weight:3, opacity:.9 }, interactive:false }).addTo(G.base);
+    G.base.addTo(map);
+  };
+  if (S.baseStreets) paint(S.baseStreets);
+  else api('/base/streets').then((fc) => { S.baseStreets = fc; paint(fc); }).catch(() => {});
 }
 async function drawReferencePick() {
   if (!S.baseStreets) S.baseStreets = await api('/base/streets');
@@ -391,12 +676,15 @@ function featureMid(f) {
 }
 const RANK_COLOR = ['#b71c1c', '#e65100', '#f9a825', '#2e7d32', '#1565c0', '#6a1b9a'];
 const RANK_NAMES = ['0 motorway / trunk', '1 primary', '2 secondary', '3 tertiary', '4 residential / service', '5 footway / path'];
+const NOT_DRIVABLE = 'no car access, may continue on foot or by motorbike';
+/* Todo 2.1: drivable yes / no / unknown per segment. "car" means drivable; "foot" (and an older "moto") means not drivable. */
+function accessLabel(access) { return I18n.t(access === 'car' ? 'drivable' : access ? NOT_DRIVABLE : 'unknown'); }
 function colourLegend() {
   const m = S.idColor;
   const ring = I18n.htmlText('<span><i class="dot" style="background:#fff;border:2px solid #d50000;box-sizing:border-box"></i>street cut here for the numbering</span>');
   const withRing = (html) => html.replace(/<\/div>$/, ring + I18n.htmlText('</div>'));            // one legend with the colours and the circle
   if (m === 'rank') return withRing(legend(RANK_NAMES.map((t, i) => [RANK_COLOR[i], t]), true));
-  if (m === 'drivable') return withRing(legend([['#1565c0', 'drivable'], ['#9e9e9e', 'not drivable (dashed)'], ['#bdbdbd', 'unknown (dotted)']], true));
+  if (m === 'drivable' || m === 'access') return withRing(legend([['#1565c0', 'drivable'], ['#9e9e9e', I18n.t(NOT_DRIVABLE)], ['#bdbdbd', 'unknown: follows the road type (dotted)']], true));
   if (m === 'paved') return withRing(legend([['#00acc1', 'paved'], ['#ef6c00', 'unpaved'], ['#bdbdbd', 'unknown (dotted)']], true));
   return I18n.html`<div class="legend">${ring}</div>`;
 }
@@ -406,11 +694,16 @@ function drawNetwork() {
   ensureColors();
   const names = S.tab === 'names';
   const maxD = Math.max(1, ...net.streets.features.map((f) => f.properties.d1 || 0));
-  const layer = L.geoJSON(net.streets, {
+  const perEdge = !names && (S.idColor === 'drivable' || S.idColor === 'access') && net.edges;      // drivable is shown per segment
+  const source = perEdge ? net.edges : net.streets;
+  const layer = L.geoJSON(source, {
     style: (f) => {
       const p = f.properties;
       if (names) return { color: statusColor(p), weight: p.status === 'planned' ? 7 : p.status === 'named' ? 5 : p.status === 'other' ? 2 : 3.5, opacity: .95 };
       if (S.idColor === 'rank') return { color: RANK_COLOR[p.rank] || '#757575', weight: 4, opacity: .95 };
+      if (perEdge) return p.access === 'car' ? { color: '#1565c0', weight: 5, opacity: .95 }
+        : p.access ? { color: '#9e9e9e', weight: 4, opacity: .95, dashArray: '8 6' }
+          : { color: '#bdbdbd', weight: 4, opacity: .95, dashArray: '2 6' };
       if (S.idColor === 'drivable' && p.drivable === null) return { color: '#bdbdbd', weight: 3, opacity: .95, dashArray: '2 5' };
       if (S.idColor === 'paved' && p.paved === null) return { color: '#bdbdbd', weight: 3, opacity: .95, dashArray: '2 5' };
       if (S.idColor === 'drivable') return p.drivable ? { color: '#1565c0', weight: 4, opacity: .95 } : { color: '#9e9e9e', weight: 3, opacity: .95, dashArray: '6 5' };
@@ -420,7 +713,7 @@ function drawNetwork() {
     },
     onEachFeature: (f, l) => {
       const p = f.properties;
-      l.bindTooltip(`${esc(p.display || '(no name yet)')} · street ${p.id}${p.part ? ` (part ${p.part + 1} of ${p.original})` : ''}`, { sticky: true });
+      l.bindTooltip(perEdge ? `${accessLabel(p.access)} · ${I18n.t('street')} ${p.id}${p.track ? ` · ${I18n.t('OSM track')}` : ''}` : `${esc(p.display || '(no name yet)')} · street ${p.id}${p.part ? ` (part ${p.part + 1} of ${p.original})` : ''}`, { sticky: true });
       l.on('click', (e) => { if (S.mode) return; L.DomEvent.stopPropagation(e); selectStreet(p.id, true, e.latlng); });
     },
   }).addTo(G.net);
@@ -503,7 +796,7 @@ document.addEventListener('change', async (e) => {                // rank / driv
       await api('/streets/attrs', body); toast('Saved');
       if (S.network) {                                           // show the change at once; the recomputation that follows confirms it
         const key = at.dataset.attr, val = body[key];
-        S.network.streets.features.forEach((f) => { if (f.properties.original === body.original && (body.part === undefined || f.properties.part === body.part)) f.properties[key] = val; });
+        S.network.streets.features.forEach((f) => { if (f.properties.original === body.original && (body.part === undefined || f.properties.part === body.part)) { f.properties[key] = val; f.properties[key + '_mixed'] = false; } });
         if (S.tab === 'ids' || S.tab === 'names') { drawNetwork(); if (S.sel) refreshSel(); }
       }
       await afterEdit();
@@ -538,7 +831,14 @@ function refreshSel() {                                       // open / update /
   const html = selHtml();
   if (!html || !S.sel || !S.sel.ll) { if (S.selPopup) { const p = S.selPopup; S.selPopup = null; map.closePopup(p); } return; }
   const content = I18n.html`<div class="selbox">${html}</div>`;
-  if (S.selPopup && S.selPopup.isOpen()) { const same = S.selPopup.getLatLng().equals(S.sel.ll); S.selPopup.setContent(content); if (!same) S.selPopup.setLatLng(S.sel.ll); return; }
+  if (S.selPopup && S.selPopup.isOpen()) {
+    const same = S.selPopup.getLatLng().equals(S.sel.ll);
+    // A refresh that ends while a name is being typed must not wipe it: keep what was typed in the same popup.
+    const typed = same ? [...document.querySelectorAll('.sel-popup input[type=text][id]')].filter((i) => i.value !== i.defaultValue).map((i) => [i.id, i.value, i === document.activeElement]) : [];
+    S.selPopup.setContent(content);
+    typed.forEach(([id, value, focused]) => { const i = document.getElementById(id); if (i) { i.value = value; if (focused) i.focus(); } });
+    if (!same) S.selPopup.setLatLng(S.sel.ll); return;
+  }
   // Opening can stop an existing pan and synchronously fire moveend. Assign
   // the popup first and guard re-entry so that handler cannot open a second
   // popup and detach the one Leaflet is still positioning.
@@ -579,7 +879,24 @@ function selectStreet(id, keepView, ll) {
 }
 
 /* ---------------------------------------------------------------- edit streets tab: add streets from a file, delete edges */
-async function loadRoads() { S.roads = await api('/roads'); }
+/* An edit that cannot be applied any more is never left out silently: say so, with the edit numbers (see /history). */
+function warnLostEdits(roads) {
+  const lost = roads?.report?.lost_edits || [], key = lost.map((l) => `${l.event}:${l.ref}`).join(',');
+  if (key && key !== S.lostEdits) toast(I18n.msg`${lost.length} road edits could not be applied (edit ${[...new Set(lost.map((l) => l.event))].join(', ')}). Undo the last edit and check the map.`, 12000);
+  S.lostEdits = key;
+}
+async function loadRoads(prepareSwap = false, expectedRevision = null) {
+  if (!prepareSwap) {
+    const roads = await api('/roads');
+    warnLostEdits(roads);
+    // A geometry replay can take long enough for another road to be saved meanwhile.  Never let that older response
+    // replace the newer optimistic trace already visible on the map.
+    if (expectedRevision === null || S.rev === expectedRevision) S.roads = roads;
+    return roads;
+  }
+  const [roads, base, components] = await Promise.all([api('/roads'), api('/base/streets'), api('/base/components')]);
+  S.roads = roads; S.baseStreets = base; S.components = components; warnLostEdits(roads);
+}
 const NEWC = (i) => `hsl(${Math.round((i * 137.5) % 360)},85%,52%)`;               // a different colour for every new street
 const NODE_STYLE = {
   connected: { radius: 9, color: '#004d40', weight: 4, fillColor: '#00e5ff', fillOpacity: 1 },
@@ -649,10 +966,13 @@ function drawRoads() {
   }
   if (S.del) { drawDeleteLayers(); return; }
   const byFile = S.roadColor === 'file';
-  api('/base/streets').then((b) => { S.baseStreets = b; if (S.tab !== 'roads' || epoch !== S.renderEpoch) return; G.base.clearLayers(); L.geoJSON(b, { style: (f) => (byFile ? (f.properties.file ? { color: FILE_COLOR(fileIndex(f.properties.file)), weight: 4, opacity: .95 } : { color: '#9e9e9e', weight: 2, opacity: .85 }) : { color: '#ffd54f', weight: 2, opacity: .85 }), interactive: false }).addTo(G.base); G.base.addTo(map); });
-  api('/base/components').then((c) => {                        // the parts cut off from the main network: red dashed
-    const had = JSON.stringify((S.components || { parts: [] }).parts), now = JSON.stringify(c.parts);      // (nothing to show: the panel is not redrawn, it may hold a file being chosen)
-    S.components = c;
+  const paintBase = (b) => {
+    if (S.tab !== 'roads' || epoch !== S.renderEpoch) return;
+    G.base.clearLayers();
+    L.geoJSON(b, { style: (f) => (byFile ? (f.properties.file ? { color: FILE_COLOR(fileIndex(f.properties.file)), weight: 4, opacity: .95 } : { color: '#9e9e9e', weight: 2, opacity: .85 }) : { color: '#ffd54f', weight: 2, opacity: .85 }), interactive: false }).addTo(G.base);
+    G.base.addTo(map);
+  };
+  const paintComponents = (c) => {                              // the parts cut off from the main network: red dashed
     if (S.tab !== 'roads' || epoch !== S.renderEpoch) return;
     L.geoJSON(c.edges, { style: { color: '#d50000', weight: 7, opacity: .9, dashArray: '2 9', lineCap: 'round' }, onEachFeature: (f, l) => {
       const id = f.properties.part, pt = c.parts.find((x) => x.id === id) || { edges: '?', length_m: 0 };
@@ -666,10 +986,16 @@ function drawRoads() {
       });
     } }).addTo(G.roadEdges);
     G.roadEdges.addTo(map);
-    if (had !== now && S.tab === 'roads') renderPanel();
-  }).catch(() => {});
+  };
+  if (S.baseStreets) paintBase(S.baseStreets);
+  else api('/base/streets').then((b) => { S.baseStreets = b; paintBase(b); }).catch(() => {});
+  if (S.components) paintComponents(S.components);
+  else api('/base/components').then((c) => { S.components = c; paintComponents(c); if (S.tab === 'roads') renderPanel(); }).catch(() => {});
   const r = S.roads; if (!r) return;
   (r.report?.uncertain_ends || []).forEach(p => L.marker([p.lat, p.lon], { icon: L.divIcon({ className: 'uncertain-end', html: '?', iconSize: [22, 22] }) }).bindTooltip('Path unclear beyond this endpoint — needs review').addTo(G.roadNodes));
+  if (r.reviews?.features?.length) L.geoJSON(r.reviews, { style: { color: '#ff6d00', weight: 9, opacity: .9, dashArray: '4 7', lineCap: 'round' },
+    onEachFeature: (f, layer) => layer.bindTooltip(`Unclear road portion · ${fmt(f.properties.selected_m, 1)} m · ${esc(f.properties.note)}`)
+  }).addTo(G.roadEdges);
   if (!byFile) L.geoJSON(r.edges, { style: { color: '#e040fb', weight: 5, opacity: .95 }, onEachFeature: (f, l) => l.bindTooltip(`new road ${esc(f.properties.name || '')} · street ${f.properties.street_id}`) }).addTo(G.roadEdges);
   G.roadEdges.addTo(map);
   L.geoJSON(r.nodes, {
@@ -703,6 +1029,45 @@ function sqMarker(ll, color) {
 }
 /* every surveyed building is visible on the Addresses tab, also before the addresses are computed (coloured by use) */
 const USE = { residential: '#43a047', commercial: '#fb8c00', industrial: '#6d4c41', office: '#1e88e5', public: '#8e24aa', unknown: '#9e9e9e' };
+function pointInRing(lon, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if (((yi > lat) !== (yj > lat)) && lon < ((xj - xi) * (lat - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function pointInArea(lon, lat, geometry) {
+  if (!geometry) return false;
+  const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
+  return polygons.some((polygon) => pointInRing(lon, lat, polygon[0]) && !polygon.slice(1).some((hole) => pointInRing(lon, lat, hole)));
+}
+function buildingQuartier(lon, lat, recorded) {
+  const feature = quartierFeatures().find((q) => pointInArea(lon, lat, q.geometry));
+  return feature ? { name: feature.properties.name, code: feature.properties.code || '', recorded: recorded || '' }
+    : { name: recorded || '', code: '', recorded: recorded || '' };
+}
+function buildingTooltip(feature, latlng) {
+  const p = feature.properties || {}, lon = feature.geometry?.type === 'Point' ? feature.geometry.coordinates[0] : latlng.lng;
+  const lat = feature.geometry?.type === 'Point' ? feature.geometry.coordinates[1] : latlng.lat;
+  const quartier = buildingQuartier(lon, lat, p.district), rows = [];
+  const add = (label, value) => { if (value !== null && value !== undefined && value !== '') rows.push(`<tr><th>${esc(I18n.t(label))}</th><td>${esc(String(value))}</td></tr>`); };
+  add('Country', 'Cameroon');
+  add('Project', S.project?.name || '');
+  add('Quartier', quartier.name);
+  add('Quartier trigram', quartier.code);
+  if (quartier.recorded && quartier.recorded.trim().toLowerCase() !== quartier.name.trim().toLowerCase()) add('Recorded quartier', quartier.recorded);
+  add('Survey record type', p.survey_type || I18n.t('Legacy record — type not recorded'));
+  add('Use', p.use);
+  add('Place name', p.name);
+  add('Service', p.service);
+  add('Residents', p.residents);
+  add('Generated address', p.address);
+  add('Address ID', p.address_id);
+  add('Coordinates', `${Number(lat).toFixed(6)}, ${Number(lon).toFixed(6)}`);
+  add('Internal record ID', p.building_id);
+  return `<div class="building-tip"><table>${rows.join('')}</table></div>`;
+}
 async function drawRawBuildings() {
   if (!S.project.has.buildings) return;
   if (!S.rawBuildings) S.rawBuildings = await api('/layers/buildings');
@@ -710,7 +1075,8 @@ async function drawRawBuildings() {
   renderPanel(); G.houses.clearLayers();
   L.geoJSON(S.rawBuildings, {
     pointToLayer: (f, ll) => L.circleMarker(ll, { radius: 4, color: '#000', weight: 1, fillColor: USE[f.properties.use] || USE.unknown, fillOpacity: .95 }),
-    onEachFeature: (f, l) => { const p = f.properties; l.bindTooltip(`${[p.use, p.name].filter(Boolean).map(esc).join(' &middot; ') || 'building'}${p.name ? '' : ''}${p.residents ? ' &middot; ' + p.residents + ' residents' : ''}`, { sticky: true }); },
+    onEachFeature: (f, l) => { const ll = f.geometry?.type === 'Point' ? L.latLng(f.geometry.coordinates[1], f.geometry.coordinates[0]) : l.getBounds().getCenter();
+      l.bindTooltip(() => buildingTooltip(f, ll), { sticky: true, className: 'building-data-tooltip' }); },
   }).addTo(G.houses);
   if (S.pointsData) L.geoJSON(S.pointsData, { pointToLayer: (f, ll) => emojiMarker(ll, f.properties.name, f.properties.kind),
     onEachFeature: (f, l) => l.bindTooltip(esc(f.properties.name || f.properties.kind || 'reference point'), { sticky: true }) }).addTo(G.houses);
@@ -725,7 +1091,8 @@ function drawAddresses() {
   L.geoJSON(a.houses, {
     pointToLayer: (f, ll) => (f.properties.use === 'reference' ? emojiMarker(ll, f.properties.name, f.properties.info, HOUSE[f.properties.status] || '#999') : L.circleMarker(ll, { radius: 5, color: '#000', weight: 1, fillColor: HOUSE[f.properties.status] || '#999', fillOpacity: .95 })),
     style: (f) => ({ color: HOUSE[f.properties.status] || '#999', weight: 2, fillOpacity: .35 }),
-    onEachFeature: (f, l) => { const p = f.properties; l.bindTooltip(esc(p.address || 'no street within reach') + (p.use ? ` &middot; ${esc(p.use)}` : '') + (p.name ? ` &middot; ${esc(p.name)}` : ''), { sticky: true });
+    onEachFeature: (f, l) => { const p = f.properties, ll = f.geometry?.type === 'Point' ? L.latLng(f.geometry.coordinates[1], f.geometry.coordinates[0]) : l.getBounds().getCenter();
+      l.bindTooltip(() => buildingTooltip(f, ll), { sticky: true, className: 'building-data-tooltip' });
       l.on('click', (e) => { if (S.mode) return; L.DomEvent.stopPropagation(e); S.sel = { type: 'house', props: p, ll: e.latlng }; drawAccess(p); renderPanel(); refreshSel(); }); },
   }).addTo(G.houses); G.houses.addTo(map);
   L.geoJSON(a.signs, { pointToLayer: (f, ll) => L.circleMarker(ll, { radius: 6, color: '#fff', weight: 2, fillColor: '#1565c0', fillOpacity: 1 }),
@@ -794,7 +1161,8 @@ function renderPanel() {
 function selectedStreetBox() {
   return I18n.html`<p class="muted">Click a street${S.tab === 'ids' ? ' or a white node' : ''} on the map: a popup opens.</p>`;
 }
-const tri = (v) => [['null', 'unknown'], ['true', 'yes'], ['false', 'no']].map(([k, t]) => I18n.html`<option value="${k}" ${String(v === undefined ? null : v) === k ? 'selected' : ''}>${I18n.t(t)}</option>`).join('');
+const tri = (v, mixed) => (mixed ? I18n.html`<option value="" selected disabled>${I18n.t('partly: choose to set all of it')}</option>` : '')
+  + [['null', 'unknown'], ['true', 'yes'], ['false', 'no']].map(([k, t]) => I18n.html`<option value="${k}" ${!mixed && String(v === undefined ? null : v) === k ? 'selected' : ''}>${I18n.t(t)}</option>`).join('');
 function streetBox(editable) {
   if (!S.sel || S.sel.type !== 'street') return '';
   const f = streetById(S.sel.id); if (!f) return '';
@@ -807,8 +1175,10 @@ function streetBox(editable) {
     <tr><td>distance to reference</td><td>${fmt(p.d0)} - ${fmt(p.d1)} m</td></tr>
     ${p.parent ? I18n.html`<tr><td>derived from</td><td>street ${p.parent}${p.root && p.root !== p.parent ? ` (main street ${p.root})` : ''}</td></tr>` : ''}</table>`;
   h += I18n.html`<div class="row attrs"><select class="attr-edit" data-attr="rank" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''} title="Street rank">${RANK_NAMES.map((t, i) => I18n.html`<option value="${i}" ${p.rank === i ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select>
-    <label>drivable <select class="attr-edit" data-attr="drivable" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''}>${tri(p.drivable)}</select></label>
-    <label>paved <select class="attr-edit" data-attr="paved" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''}>${tri(p.paved)}</select></label></div>${parts.length > 1 ? I18n.htmlText('<p class="muted">Applies to this part only.</p>') : ''}`;
+    <label>drivable <select class="attr-edit" data-attr="drivable" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''}>${tri(p.drivable, p.drivable_mixed)}</select></label>${p.drivable === false && !p.drivable_mixed ? I18n.html`<span class="muted">${I18n.t(NOT_DRIVABLE)}</span>` : ''}
+    <label>paved <select class="attr-edit" data-attr="paved" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''}>${tri(p.paved, p.paved_mixed)}</select></label>
+    <label>gives addresses <select class="attr-edit" data-attr="addresses" data-orig="${p.original}" ${parts.length > 1 ? `data-part="${p.part}"` : ''}>${[['true', 'yes'], ['false', 'no']].map(([k, t]) => I18n.html`<option value="${k}" ${String(p.addresses !== false) === k ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select></label></div>
+    ${p.addresses === false ? I18n.htmlText('<p class="muted">Small path: its houses take the number where it leaves the street, with a letter (230A, 230B). Compute the addresses to apply.</p>') : ''}${parts.length > 1 ? I18n.htmlText('<p class="muted">Applies to this part only.</p>') : ''}`;
   if (parts.length > 1) h += I18n.html`<p class="muted">Cut parts: ${parts.map((g) => I18n.html`<a href="#" data-act="select" data-id="${g.properties.id}">${g.properties.id}</a>`).join(', ')}</p>`;
   if (editable) {
     const dup = assigned && S.network.streets.features.some((g) => g.properties.original !== p.original && g.properties.name && g.properties.name.toLowerCase() === assigned.toLowerCase());
@@ -823,36 +1193,41 @@ function streetBox(editable) {
 }
 
 function panelIds() {
-  if (!S.network) return I18n.html`<h3>Street ids</h3><p>Computing the street ids...</p>`;
+  if (S.project.stale) return I18n.htmlText('<h3>Street types and IDs</h3><div class="warnbox"><strong>Pending road edits</strong><p>The current road geometry is shown in orange. Old IDs and colours are hidden because they no longer match it. Continue editing in step 1, or use Recompute IDs when your batch is ready.</p></div>');
+  if (!S.network) return I18n.html`<h3>Street types and IDs</h3><p>Computing the street ids...</p>`;
   const st = S.network.stats, sg = S.network.streets.features.map((f) => f.properties);
   const cut = {}; sg.filter((p) => p.part > 0 || sg.some((q) => q.original === p.original && q.part > 0)).forEach((p) => { (cut[p.original] = cut[p.original] || []).push(p); });
   const cutRows = Object.entries(cut).slice(0, 60).map(([o, ps]) => I18n.html`<tr class="click" data-act="select" data-id="${ps[0].id}"><td>${o}</td><td>${ps.map((q) => q.id).join(', ')}</td><td>${esc(ps[0].name || '')}</td></tr>`).join('');
   const s = S.project.settings;
-  return I18n.html`<h3>Street ids</h3>${stale()}
-  <h3>Colour by</h3><div class="row"><select id="color-mode">${[['id', 'street id'], ['distance', 'distance to the reference'], ['rank', 'street rank'], ['drivable', 'drivable'], ['paved', 'paved']].map(([v, t]) => I18n.html`<option value="${v}" ${S.idColor === v ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select></div>${colourLegend()}
+  return I18n.html`<h3>Street types and IDs</h3>${stale()}
+  <h3>Colour by</h3><div class="row"><select id="color-mode">${[['id', 'street id'], ['distance', 'distance to the reference'], ['rank', 'street rank'], ['drivable', 'drivable'], ['paved', 'paved']].map(([v, t]) => I18n.html`<option value="${v}" ${S.idColor === v || (v === 'drivable' && S.idColor === 'access') ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select></div>${colourLegend()}
     <table><tr><td>streets</td><td><strong>${st.streets}</strong></td></tr><tr><td>original ids</td><td>${st.original_ids}</td></tr>
     <tr><td>new ids from cutting</td><td>${st.new_ids_from_cutting} (${st.cut_points} cut points)</td></tr></table>
     ${selectedStreetBox(false)}
     <details class="sec"><summary>Streets that were cut (${Object.keys(cut).length})</summary><table><tr><th>orig</th><th>ids</th><th>name</th></tr>${cutRows || I18n.htmlText('<tr><td colspan="3" class="muted">none</td></tr>')}</table></details>
     <details class="sec"><summary>Settings</summary>
-      <p>Derivation levels <input type="number" min="0" max="4" id="set-levels" value="${s.max_levels}"></p>
-      <p>Second-level names (x-y-name) for drive roads shorter than (m) <input type="number" min="0" id="set-deep" value="${s.second_level_max_drive_m}"> <span class="muted">(non-drive roads always may)</span></p>
-      <p>House step (m) <input type="number" step="0.5" id="set-house" value="${s.house_step_m}"></p>
-      <p>Sub-street step (m) <input type="number" step="1" id="set-branch" value="${s.branch_step_m}"></p>
+      <p class="muted">Naming rules: highways, primary and secondary roads always need their own name; other roads may take one derived name (Voie 3 du xyz), never two levels (Voie 3/3 du xyz).</p>
+      <p class="muted">Approved address rule: a house number represents metres from the street start; a branch prefix represents tens of metres.</p>
+      <p>Metres per house number <input type="number" min="0.1" step="0.1" id="set-house" value="${s.house_step_m}"></p>
+      <p>Metres per branch prefix <input type="number" min="0.1" step="0.1" id="set-branch" value="${s.branch_step_m}"></p>
       <p>Houses farther than (m) from a road get no address <input type="number" id="set-dist" value="${s.max_house_distance_m}"></p>
       <p><label><input type="checkbox" id="set-conn" ${s.connect_backbone ? 'checked' : ''}> named streets must connect to the reference through named streets</label></p>
       <button data-act="apply-settings">Apply settings</button></details>`;
 }
 
 function panelNames() {
+  if (S.project.stale) return I18n.htmlText('<h3>Street names</h3><div class="warnbox"><strong>Pending road edits</strong><p>The current road geometry is shown in orange. Old street names and IDs are hidden because they may refer to roads that were moved, added or undone. Recompute IDs when your geometry batch is ready.</p></div>');
   if (!S.network) return I18n.html`<h3>Street names</h3><p>Computing the street ids...</p>`;
   const st = S.network.stats, sg = S.network.streets.features.map((f) => f.properties);
   const c = (k) => sg.filter((p) => p.status === k).length; const d1 = sg.filter((p) => p.status === 'derived' && p.level === 1).length, d2 = sg.filter((p) => p.status === 'derived' && p.level === 2).length;
+  const proof = st.plan_optimal ? 'minimum proven on the final cut network' : 'feasible final plan; minimum not proven';
+  const reduction = st.plan_reduced_by ? ` · ${st.plan_reduced_by} ${I18n.t(st.plan_reduced_by === 1 ? 'task removed by final optimisation' : 'tasks removed by final optimisation')}` : '';
   const rows = S.network.plan.slice(0, S.planAll ? 1e6 : 25).map((r) => I18n.html`<tr class="click" data-act="goto-plan" data-id="${r.street_ids.split(';')[0]}"><td>${r.order}</td><td>${r.street_id_original}</td><td>${fmt(r.length_m)}</td><td>${r.covers}</td><td>${esc(r.reason)}</td></tr>`).join('');
   return I18n.html`<h3>Street names</h3>${stale()}
         ${bar([[c('named'), STATUS.named, 'named'], [d1, STATUS.derived, 'derived 1'], [d2, STATUS.derived2, 'derived 2'], [c('planned'), STATUS.planned, 'to name'], [c('uncovered'), STATUS.uncovered, 'uncovered']])}
     ${legend([[STATUS.named, `named ${c('named')}`], [STATUS.derived, `x-name ${d1}`], [STATUS.derived2, `x-y-name ${d2}`], [STATUS.planned, `still to name ${st.to_be_named}`], ...(c('uncovered') ? [[STATUS.uncovered, `cannot be named ${c('uncovered')}`]] : []), ...(c('other') ? [[STATUS.other, `not a road ${c('other')}`]] : [])])}
     <p class="muted">${st.to_be_named} ${I18n.t(st.to_be_named === 1 ? 'street needs' : 'streets need')} a name (red). Naming them lets the others derive theirs.</p>
+    <p class="muted">${I18n.t('Planner')}: ${esc(st.plan_method || 'unknown')} · ${I18n.t(proof)} · ${st.rounds} ${I18n.t('routing rounds')}${reduction}</p>
     ${selectedStreetBox(true)}
     <h3>Streets to name, in priority order</h3>
     <table><tr><th>#</th><th>street</th><th>m</th><th>covers</th><th>why</th></tr>${rows || I18n.htmlText('<tr><td colspan="5" class="muted">nothing left to name</td></tr>')}</table>
@@ -862,35 +1237,73 @@ function panelNames() {
 function panelAddresses() {
   const a = S.addresses; const hasB = S.project.has.buildings;
   if (!hasB) return I18n.htmlText('<h3>Addresses</h3><p>This project has no houses to address (input/buildings.gpkg).</p>');
-  let h = I18n.html`<h3>House numbers, addresses and street signs</h3>${S.project.addresses_stale || S.polling ? I18n.htmlText('<p><span class="badge warn">updating...</span></p>') : ''}`;
+  const needsUpdate = !S.project.addresses_ready || S.project.addresses_stale;
+  const update = needsUpdate ? (S.project.stale
+    ? I18n.htmlText('<p><span class="badge warn">Road edits not applied</span> Recompute IDs first; switching tabs will not do it automatically.</p>')
+    : I18n.htmlText('<p><button class="primary" data-act="compute-addresses">Compute addresses</button></p>')) : '';
+  let h = I18n.html`<h3>House numbers, addresses and street signs</h3>${update}`;
   if (!a) {
     const fs = S.rawBuildings ? S.rawBuildings.features : [], n = {}; fs.forEach((f) => { const u = f.properties.use || 'unknown'; n[u] = (n[u] || 0) + 1; });
-    return h + I18n.html`<p>Computing the addresses... All ${fs.length || ''} surveyed buildings are shown, coloured by use.</p>` + legend([...Object.keys(USE).filter((u) => n[u]).map((u) => [USE[u], `${u} ${n[u]}`]), ...(S.pointsCount ? [['#ffffff', `reference points ${S.pointsCount} (emoji by type)`, true]] : [])], true);
+    return h + I18n.html`<p>Addresses have not been computed for the current data. All ${fs.length || ''} surveyed buildings are shown, coloured by use.</p>` + legend([...Object.keys(USE).filter((u) => n[u]).map((u) => [USE[u], `${u} ${n[u]}`]), ...(S.pointsCount ? [['#ffffff', `reference points ${S.pointsCount} (emoji by type)`, true]] : [])], true);
   }
   const s = a.stats;
   h += bar([[s.addressed, HOUSE.ok, 'addressed'], [s.pending_name, HOUSE.pending_name, 'street still to be named'], [s.no_name, HOUSE.no_name, 'no name'], [s.no_street, HOUSE.no_street, 'no road']]);
   h += legend([[HOUSE.ok, `address ${s.addressed}`], [HOUSE.pending_name, `street to be named ${s.pending_name}`], [HOUSE.no_name, `no name ${s.no_name}`], [HOUSE.no_street, `too far from a road ${s.no_street}`], ['#ffffff', `reference points ${a.houses.features.filter((f) => f.properties.use === 'reference').length} (emoji by type)`, true]], true);
   h += I18n.html`<p class="muted">${s.houses} houses &middot; ${s.signs} street signs (blue) &middot; ${s.manual_road_points} road points chosen by hand</p>
-    <input type="text" id="addr-search" placeholder="Search an address..."><div id="addr-results"></div>
+    <label for="addr-search"><b>Search</b></label><input type="text" id="addr-search" placeholder="Address, family name or survey id (e.g. TCK 0575, HIE-I022)"><div id="addr-results"></div>
     <details class="sec"><summary>Reference points on the street signs${S.pointRanks ? ` (${S.pointRanks.length})` : ''}</summary>
       <p class="muted">Rank = how important a point is for the signs.</p>
       <table>${(S.pointRanks || []).map((q) => I18n.html`<tr><td class="click" data-act="goto-point" data-lat="${q.lat}" data-lon="${q.lon}">${esc(q.name || q.info)}</td><td>${ptRankSelect(q.id, q.rank)}</td></tr>`).join('') || I18n.htmlText('<tr><td class="muted">loading...</td></tr>')}</table></details>`;
+  const rg = a.register || { approved: 0, retired: 0, changed: 0 }, area = S.activeArea;
+  h += I18n.html`<details class="sec" open><summary>Register: validated addresses and their changes</summary>
+    <p>${rg.approved} validated &middot; ${rg.retired} retired${rg.changed ? I18n.html` &middot; <span class="badge warn">${rg.changed} changes to validate</span>` : ''}</p>
+    <p class="muted">A validated address is the one on the plaque. When a road edit would change it, the change waits here; once validated, the family is on the list to inform (before / after, name, phone, position).</p>
+    <div class="row">${area ? I18n.html`<button data-act="approve-area" data-id="${esc(area)}">Validate all addresses in ${esc(area)}</button>` : I18n.htmlText('<span class="muted">Choose a work area to validate its addresses together.</span>')}
+      ${rg.changed ? I18n.html`<button data-act="validate-changes">Validate the ${rg.changed} changes</button>` : ''}</div>
+    <div class="row"><a class="btn" href="api/register.csv">Download the register (CSV)</a>${!window.AuthUI || AuthUI.can('admin') ? I18n.htmlText('<a class="btn" href="api/register/changes.csv">Families to inform (CSV)</a>') : ''}</div></details>`;
   h += I18n.htmlText('<p class="muted">Click a building to see its address, side of the road and road point.</p>');
   return h;
 }
 
+const QUARTIER_NAMES = ['Babong', 'Badenla', 'Balafi', 'Balatchie', 'Bamendjo', 'Bandja', 'Bankwop', 'Bano', 'Djeugne', 'Fangam', 'Fotouni', 'Hiela',
+  'Kouotchack', 'Lassié', 'Mbeum', 'Mving', 'Ngonfet', "Nguaka'am", 'Song', 'Tcham', 'Tchikong', 'Tchisso', 'Tchouno', 'Toukong', 'Demkwouo'];   // Overview Abbreviations
 const PT_RANKS = ['0 not on the signs', '1 landmark', '2 important', '3 local'];
 const ptRankSelect = (id, v) => I18n.html`<select class="pt-rank" data-id="${esc(id)}">${PT_RANKS.map((t, i) => I18n.html`<option value="${i}" ${v === i ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select>`;
 function houseBox() {
   if (!S.sel || S.sel.type !== 'house') return '';
-  const p = S.sel.props, row = (k, v) => (v === null || v === undefined || v === '' ? '' : I18n.html`<tr><td>${k}</td><td>${esc(String(v))}</td></tr>`);
+  const p = S.sel.props, row = (k, v) => (v === null || v === undefined || v === '' ? '' : I18n.html`<tr><td>${esc(I18n.t(k))}</td><td>${esc(I18n.t(String(v)))}</td></tr>`);
   const az = p.azimuth !== null && p.azimuth !== undefined && p.azimuth === p.azimuth ? `${Math.round(p.azimuth)}\u00b0` : null;
-  return I18n.html`<h3>${esc(p.address || 'no address')}</h3>
-    <table>${row('number', p.number)}${row('street', p.street ? `${p.street} (id ${p.street_id})` : p.street_id !== null && p.street_id !== undefined ? `id ${p.street_id}, no name yet` : null)}
-      ${row('side', p.side ? `${p.side}${p.side_source === 'azimuth' ? ' (from the azimuth)' : ' (from the position)'}` : null)}${row('azimuth', az)}
+  const admin = !window.AuthUI || AuthUI.can('admin');
+  S.households = S.households || {};
+  const hh = S.households[p.building_id];
+  if (admin && hh === undefined && p.use !== 'reference') {                 // private survey details: fetched for administrators only
+    S.households[p.building_id] = null;
+    api(`/households/${encodeURIComponent(p.building_id)}`).then((r) => { S.households[p.building_id] = r; renderPanel(); }).catch(() => { S.households[p.building_id] = false; renderPanel(); });
+  }
+  return I18n.html`<h3 class="plate">${esc(p.plate || p.address || 'no address')}</h3>
+    <details class="sec" open><summary>For the plaque and the address card</summary><table>
+      ${row('quartier', p.quartier_code ? `${p.district || ''} (${p.quartier_code})` : p.district ? `${p.district}: not in the catalogue` : null)}
+      ${row('name on the plaque', p.plaque_name || (p.use === 'reference' ? null : 'missing (no family name in the survey)'))}
+      ${row('address', p.plate || (p.number ? 'incomplete (quartier without trigram)' : null))}
+      ${row('street part', p.street_code)}${row('house part', p.number)}
+      ${row('written address', p.address)}${row('survey address id', p.address_id)}
+      ${hh ? I18n.html`${row('contact (private)', hh.contact_name)}${row('phone (private)', hh.contact_phone || hh.commerce_phone || hh.public_phone)}${row('persons', hh.persons_count)}` : ''}
+    </table>${admin && hh === false && p.use !== 'reference' ? I18n.htmlText('<p class="muted">No survey record imported for this building.</p>') : ''}
+    ${p.use !== 'reference' ? I18n.html`<div class="row"><select id="house-quartier">${['', ...QUARTIER_NAMES].map((q) => I18n.html`<option value="${esc(q)}" ${q === (p.quartier_code ? p.district : '') ? 'selected' : ''}>${esc(q || I18n.t('as in the survey'))}</option>`).join('')}</select>
+      <button data-act="set-quartier" data-id="${esc(p.building_id)}">Correct the quartier</button></div>${p.survey_district && p.survey_district !== p.district ? I18n.html`<p class="muted">Survey wrote: ${esc(p.survey_district)}</p>` : ''}` : ''}</details>
+    <table>${row('street', p.street ? `${p.street} (id ${p.street_id})` : p.street_id !== null && p.street_id !== undefined ? `id ${p.street_id}, no name yet` : null)}
+      ${row('side', p.side ? `${p.side}${p.side_source === 'azimuth' ? ' (from the azimuth)' : p.side_source === 'path' ? ' (where its path leaves the street)' : ' (from the position)'}` : null)}${row('azimuth', az)}
+      ${p.via_path !== null && p.via_path !== undefined ? row('reached by', `path ${p.via_path} (gives no addresses)`) : ''}
+      ${row('register', p.register_status === 'approved' ? `validated${p.approved_at ? ' ' + String(p.approved_at).slice(0, 10) : ''}` : p.register_status === 'retired' ? 'retired' : 'draft (not validated)')}${row('internal id', p.code)}
       ${p.use === 'reference' ? I18n.html`<tr><td>sign rank</td><td>${ptRankSelect(p.building_id, p.sign_rank)}</td></tr>` : ''}${row('use', p.use)}${row('name', p.name)}${row('residents', p.residents)}${row('road point', p.source === 'manual' ? 'chosen by hand' : p.road_lat ? 'nearest road (purple)' : null)}${row('status', p.status)}</table>
+    ${p.changed ? I18n.html`<p><span class="badge warn">Change to validate</span> The map now gives ${esc(p.computed_plate || p.computed_address || 'no address')}. The validated address stays until you validate the change; the family is then on the list to inform.</p>` : ''}
     <div class="row"><button data-act="pick-access" data-id="${esc(p.building_id)}">Choose the road point</button>
-    ${p.source === 'manual' ? I18n.html`<button class="danger" data-act="clear-access" data-id="${esc(p.building_id)}">Nearest road</button>` : ''}</div>`;
+    ${p.source === 'manual' ? I18n.html`<button class="danger" data-act="clear-access" data-id="${esc(p.building_id)}">Nearest road</button>` : ''}</div>
+    ${p.number ? I18n.html`<div class="row">${p.register_status !== 'approved' && p.plate && p.use !== 'reference' ? I18n.html`<button class="primary" data-act="approve-house" data-id="${esc(p.building_id)}">Validate this address</button>` : ''}
+      ${p.register_status === 'approved' && p.changed ? I18n.html`<button data-act="correct-house" data-id="${esc(p.building_id)}">Validate the change</button>` : ''}
+      <a class="btn" href="api/plaque/${encodeURIComponent(p.building_id)}.svg" target="_blank" rel="noopener">${p.register_status === 'approved' ? 'Plaque' : 'Draft plaque'}</a>
+      <a class="btn" href="api/card/${encodeURIComponent(p.building_id)}.svg" target="_blank" rel="noopener">${p.register_status === 'approved' ? 'Address card' : 'Draft address card'}</a>
+      ${p.register_status === 'approved' ? I18n.html`<button class="danger" data-act="retire-house" data-id="${esc(p.building_id)}">Retire (house gone)</button>` : ''}</div>` : ''}`;
 }
 
 function nodePanel(staged) {
@@ -926,6 +1339,8 @@ function startDraw(mode) {
   if (mode === 'prolong') api('/base/ends').then((e) => { if (S.draw) { S.draw.ends = e; drawTab(); } });
   drawTab();
 }
+function isReshapeMode(draw) { return !!draw && (draw.mode === 'reshape' || draw.mode === 'reshape-partial'); }
+function isPlannedRoute(draw) { return !!draw && (draw.mode === 'route' || draw.mode === 'reshape-partial'); }
 function stopDraw() { if (S.draw && S.draw.preview) map.removeLayer(S.draw.preview); S.draw = null; map.dragging.enable(); setMode(null); map.doubleClickZoom.enable(); drawTab(); }
 async function pickRoadToReshape(action = 'reshape') {
   S.stage = null; S.del = null; S.sel = null;
@@ -935,12 +1350,13 @@ async function pickRoadToReshape(action = 'reshape') {
 }
 function drawReshapeChoices() {
   L.geoJSON({ type: 'FeatureCollection', features: S.reshapePick.edges.features.filter(inWorkArea) }, { style: { color: '#00bcd4', weight: 6 }, onEachFeature: (f, layer) => {
-    layer.bindTooltip(`Street ${f.properties.street_id ?? '?'}: click to reshape this section`);
+    const action = S.reshapePick.action;
+    layer.bindTooltip(action === 'review' ? `Street ${f.properties.street_id ?? '?'}: click to mark an unclear portion` : `Street ${f.properties.street_id ?? '?'}: click to ${action === 'cut' ? 'remove part of' : 'reshape'} this section`);
     layer.on('click', (e) => {
       L.DomEvent.stopPropagation(e);
       const revision = S.reshapePick.revision;
-      if (S.reshapePick.action === 'cut') {
-        S.cut = { feature: f, revision, points: [] }; S.reshapePick = null;
+      if (['cut', 'partial', 'review'].includes(S.reshapePick.action)) {
+        S.cut = { feature: f, revision, points: [], reshape: S.reshapePick.action === 'partial', review: S.reshapePick.action === 'review' }; S.reshapePick = null;
         setMode('cut'); drawTab(); return;
       }
       startDraw('reshape');
@@ -958,7 +1374,7 @@ async function addCutPoint(ll) {
   c.points.push([ll.lng, ll.lat]); c.preview = null;
   if (c.points.length === 2) {
     c.busy = true;
-    try { c.preview = await api('/roads/cut/preview', { ref: c.feature.properties.ref, points: c.points }); }
+    try { c.preview = await api(c.reshape ? '/roads/geometry/partial/preview' : '/roads/cut/preview', { ref: c.feature.properties.ref, points: c.points }); }
     catch (e) { c.points.pop(); toast(e.message, 6000); }
     finally { c.busy = false; }
   }
@@ -966,10 +1382,33 @@ async function addCutPoint(ll) {
 }
 function drawCutLayers() {
   const c = S.cut;
+  drawCurrentRoadContext(S.renderEpoch);
+  if (c.reshape) {
+    banner(c.preview ? 'Orange portion selected. Continue to trace its replacement.' : 'Click anchor A before the incorrect portion, then anchor B after it, also further along the road.', true);
+    if (c.preview) {
+      const next = document.createElement('button'); next.id = 'banner-next'; next.textContent = I18n.t('Trace replacement');
+      next.className = 'primary'; next.onclick = () => ACT['partial-start']();
+      const cancel = $('#banner-cancel'); cancel.parentNode.insertBefore(next, cancel);
+    }
+  } else if (c.review) {
+    banner(c.preview ? 'Orange portion selected. Save it as unclear or reset the points.' : 'Click where the unclear portion starts, then where it ends.', true);
+  }
   L.geoJSON(c.feature, { style: { color: '#f9a825', weight: 7 }, onEachFeature: (f, layer) => layer.on('click', e => { L.DomEvent.stopPropagation(e); addCutPoint(e.latlng); }) }).addTo(G.roadEdges);
   c.points.forEach(([lon, lat], i) => L.circleMarker([lat, lon], { radius: 7, color: '#d50000', fillOpacity: 1 }).bindTooltip(`Cut point ${i+1}`).addTo(G.roadNodes));
-  if (c.preview) L.geoJSON(c.preview, { style: { color: '#d50000', weight: 9 }, interactive: false }).addTo(G.roadEdges);
+  if (c.preview) L.geoJSON(c.preview, { style: { color: c.reshape || c.review ? '#ff6d00' : '#d50000', weight: 9 }, interactive: false }).addTo(G.roadEdges);
   G.roadEdges.addTo(map); G.roadNodes.addTo(map);
+}
+function drawCurrentRoadContext(epoch) {
+  api('/roads/geometry').then((current) => {
+    if (S.tab !== 'roads' || epoch !== S.renderEpoch || (!S.cut && !S.draw)) return;
+    G.base.clearLayers();
+    const context = L.geoJSON(current.edges, {
+      style: { color: '#ffd54f', weight: 2.5, opacity: .72 },
+      interactive: false,
+    }).addTo(G.base);
+    G.base.addTo(map);
+    context.eachLayer((layer) => { if (layer.bringToBack) layer.bringToBack(); });
+  }).catch(() => {});
 }
 function snapMetres(ll) { const mpp = 156543.03 * Math.cos(ll.lat * Math.PI / 180) / Math.pow(2, map.getZoom()); return Math.max(1.5, Math.min(8, 9 * mpp)); }   // about 9 screen pixels, never more than 8 m
 /* Always resolve context actions against the effective graph, including cut fragments. */
@@ -992,7 +1431,7 @@ map.on('contextmenu', async e => {
     const current = await api('/roads/geometry'), choices = nearbyRoads(current.edges, e.latlng);
     if (!choices.length) { toast('No current road section here. Zoom in and right-click closer to the line.'); return; }
     const box = document.createElement('div'); box.className = 'road-context';
-    box.innerHTML = I18n.html`<strong>Road editing</strong><select aria-label="Road section">${choices.map((f,i)=>I18n.html`<option value="${i}">${esc(f.properties.ref)} · street ${esc(f.properties.street_id ?? '?')}</option>`).join('')}</select><p class="road-end-info"></p><div>${[['reshape','Reshape this section'],['cut','Delete a portion (two points)'],['whole','Delete this whole section'],['join','Connect an endpoint to a road'],['extend','Extend from a free endpoint'],['ids','Street IDs / group segments'],['names','Street names']].map(([a,t])=>I18n.html`<button data-road-action="${a}" style="display:block;margin:4px 0">${I18n.t(t)}</button>`).join('')}</div>`;
+    box.innerHTML = I18n.html`<strong>Road editing</strong><select aria-label="Road section">${choices.map((f,i)=>I18n.html`<option value="${i}">${esc(f.properties.ref)} · street ${esc(f.properties.street_id ?? '?')}</option>`).join('')}</select><p class="road-end-info"></p><div>${[['route','Draw a road from two points'],['access','Set drivable from here (A → B)'],['review','Mark an unclear portion'],['partial','Reshape between two points'],['reshape','Reshape this whole section'],['cut','Delete a portion (two points)'],['whole','Delete this whole section'],['join','Connect an endpoint to a road'],['extend','Extend from a free endpoint'],['ids','Street IDs / group segments'],['names','Street names']].map(([a,t])=>I18n.html`<button data-road-action="${a}" style="display:block;margin:4px 0">${I18n.t(t)}</button>`).join('')}</div>`;
     const selected = () => choices[+box.querySelector('select').value];
     const info = () => { const f=selected(),p=f.properties; box.querySelector('.road-end-info').textContent = `${fmt(p.length_m,1)} m · A: ${I18n.t(p.degree_u === 1 ? 'free end' : 'junction')} · B: ${I18n.t(p.degree_v === 1 ? 'free end' : 'junction')}`; G.hl.clearLayers(); L.geoJSON(f,{style:{color:'#00e5ff',weight:8,opacity:.65},interactive:false}).addTo(G.hl); G.hl.addTo(map); };
     box.querySelector('select').onchange = info; info();
@@ -1003,12 +1442,24 @@ map.on('contextmenu', async e => {
         map.closePopup(); await switchTab('roads');
         S.cut=null; S.join=null; S.reshapePick=null; S.del=null;
         if (action === 'ids' || action === 'names') { await switchTab(action); return; }
+        if (action === 'route') {
+          startDraw('route');
+          const d=S.draw; d.picking=true;
+          const target=await snapAt(e.latlng);
+          if (S.draw !== d) return;
+          const point=target ? [target.lat,target.lon] : [e.latlng.lat,e.latlng.lng];
+          d.pts=[point]; d.snaps=[target]; d.start=target; d.phase='end'; d.picking=false;
+          drawTab(); return;
+        }
+        if (action === 'access') {                                      // the right-clicked place is A; the next click is B
+          S.edgeAccess = { a: { lat: e.latlng.lat, lon: e.latlng.lng }, result: null, route: 0 }; setMode('edge-access', { a: true }); drawTab(); return;
+        }
         if (action === 'reshape') {
           startDraw('reshape'); Object.assign(S.draw,{ref:f.properties.ref, revision, snap:false, pts:f.geometry.coordinates.map(([x,y])=>[y,x])});
           S.draw.snaps=S.draw.pts.map(()=>null); S.draw.original=S.draw.pts.map(p=>[...p]); drawTab(); return;
         }
-        if (action === 'cut' || action === 'whole') {
-          S.cut={feature:f,revision,points:[],whole:action==='whole'};
+        if (action === 'review' || action === 'partial' || action === 'cut' || action === 'whole') {
+          S.cut={feature:f,revision,points:[],whole:action==='whole',reshape:action==='partial',review:action==='review'};
           if (S.cut.whole) { const c=f.geometry.coordinates; S.cut.points=[c[0],c[c.length-1]]; S.cut.preview=await api('/roads/cut/preview',{ref:f.properties.ref,points:S.cut.points,whole:true}); }
           setMode('cut'); drawTab(); return;
         }
@@ -1051,7 +1502,7 @@ function drawJoinLayers() {
 async function snapAt(ll) { try { const m = snapMetres(ll); return (await api('/roads/snap', { lat: ll.lat, lon: ll.lng, max_m: m, node_m: m })).target; } catch (e) { return null; } }
 async function addDrawPoint(ll) {                            // every point snaps to a node or a road under the mouse (about 9 pixels, at most 8 m), so the new road gets connected there
   const d = S.draw; if (!d || d.saving) return;
-  if (d.mode === 'route') {
+  if (isPlannedRoute(d)) {
     if (d.picking || d.reached) return;
     if (d.phase !== 'trace') {
       d.picking = true;
@@ -1131,7 +1582,7 @@ function endDrawStroke() {
   } else {
     const hadPoints = d.pts.length > 0;
     stroke.slice(hadPoints ? 1 : 0).forEach(p => { d.pts.push(p); d.snaps.push(null); });
-    if (d.mode === 'route' && map.latLngToContainerPoint(d.pts[d.pts.length-1]).distanceTo(map.latLngToContainerPoint(d.target)) <= 12) {
+    if (isPlannedRoute(d) && map.latLngToContainerPoint(d.pts[d.pts.length-1]).distanceTo(map.latLngToContainerPoint(d.target)) <= 12) {
       d.pts[d.pts.length-1] = [...d.target]; d.snaps[d.snaps.length-1] = d.endTarget; d.reached = true;
     }
   }
@@ -1142,15 +1593,18 @@ window.addEventListener('blur', endDrawStroke);
 async function finishDraw(recompute) {
   endDrawStroke();
   const d = S.draw; if (!d || d.pts.length < 2 || d.saving) return;
-  if (d.mode === 'route' && !d.reached && !d.uncertain) { toast('Continue to the planned end, or mark this endpoint as unclear.'); return; }
+  if (isPlannedRoute(d) && !d.reached && !(d.mode === 'route' && d.uncertain)) { toast('Continue tracing until you reach the planned end.'); return; }
   d.saving = true;
   try {
     await Promise.all([...d.pending]);
     if (S.draw !== d) return;
-    if (d.mode === 'reshape') {
-      await api('/roads/geometry', { ref: d.ref, revision: d.revision, coords: d.pts.map(([lat, lon]) => [lon, lat]) });
+    if (isReshapeMode(d)) {
+      const endpoint = d.mode === 'reshape-partial' ? '/roads/geometry/partial' : '/roads/geometry';
+      const payload = { ref: d.ref, revision: d.revision, coords: d.pts.map(([lat, lon]) => [lon, lat]) };
+      if (d.mode === 'reshape-partial') { payload.points = d.anchors; if (d.uncertain) payload.end_review = 'uncertain'; }
+      await api(endpoint, payload);
       stopDraw(); await afterEdit(); await loadRoads(); drawTab();
-      toast('Road reshaped. Junctions and street identity retained; recompute to update addresses.');
+      toast(d.mode === 'reshape-partial' ? 'Selected road portion reshaped; the rest was preserved.' : 'Road reshaped. Junctions and street identity retained; recompute to update addresses.');
       if (recompute) recomputeIfStale();
       return;
     }
@@ -1168,9 +1622,18 @@ async function finishDraw(recompute) {
     const cuts = [0]; for (let i = 1; i < last; i++) if (d.snaps[i]) cuts.push(i); cuts.push(last);          // a snapped point in the middle splits the line there
     const pieces = cuts.slice(1).map((c, k) => { const a = cuts[k]; return { coords: d.pts.slice(a, c + 1).map(([la, lo]) => [lo, la]), start: d.snaps[a] || (d.snap ? null : { type: 'none' }), end: d.snaps[c] || (d.snap ? null : { type: 'none' }) }; });
     const name = ($('#draw-name') && $('#draw-name').value.trim()) || d.name || null;
-    await api('/roads/draw', Object.assign({ pieces, name, join: d.join, end_review: d.uncertain ? 'uncertain' : undefined }, d.mode !== 'prolong' ? { rank: d.rank, drivable: d.drivable, paved: d.paved } : {}));
-    const mode = d.mode; stopDraw(); await afterEdit(); await loadRoads(); toast(`Road added (${d.snaps.filter(Boolean).length} connections)`);
-    drawTab();
+    const saved = await api('/roads/draw', Object.assign({ pieces, name, join: d.join, end_review: d.uncertain ? 'uncertain' : undefined }, d.mode !== 'prolong' ? { rank: d.rank, drivable: d.drivable, paved: d.paved } : {}));
+    const mode = d.mode; stopDraw(); await afterEdit();
+    if (saved.edges?.features?.length) {
+      if (!S.roads) S.roads = { edges: { type:'FeatureCollection', features:[] }, nodes: { type:'FeatureCollection', features:[] }, reviews: { type:'FeatureCollection', features:[] }, report:{} };
+      const added = new Set(saved.edges.features.map((f) => f.properties.feature));
+      S.roads.edges.features = [...(S.roads.edges?.features || []).filter((f) => !added.has(f.properties.feature)), ...saved.edges.features];
+    }
+    toast(`Road added (${d.snaps.filter(Boolean).length} connections)`); drawTab();
+    // Refresh snapping, nodes and warnings in the background.  The saved trace above stays visible while the expensive
+    // replay runs, so geometry work can continue without forcing a street-id recomputation after every road.
+    const savedRevision = S.rev;
+    loadRoads(false, savedRevision).then(() => { if (S.rev === savedRevision && S.tab === 'roads' && !S.draw) drawTab(); }).catch((error) => toast(error.message, 4500));
     if (recompute) recomputeIfStale();
   } finally { d.saving = false; }
 }
@@ -1179,7 +1642,7 @@ function drawDrawLayers() {
   const d = S.draw;
   if (d.target) L.marker(d.target, { icon: L.divIcon({ className: 'road-target', html: 'End', iconSize: [30, 22] }) }).bindTooltip('Planned endpoint — no line is added until you trace to it').on('click', e => { L.DomEvent.stopPropagation(e); if (d.tool === 'points') addDrawPoint(L.latLng(d.target)); }).addTo(G.roadNodes);
   G.roadNodes.addTo(map);
-  api('/base/streets').then((b) => { S.baseStreets = b; if (S.tab !== 'roads' || epoch !== S.renderEpoch) return; G.base.clearLayers(); L.geoJSON(b, { style: { color: '#ffd54f', weight: 2, opacity: .7 }, interactive: false }).addTo(G.base); G.base.addTo(map); });
+  drawCurrentRoadContext(epoch);
   if (d.mode === 'prolong' && !d.start && d.ends) {
     d.ends.forEach(([node, lon, lat, sid]) => L.circleMarker([lat, lon], { radius: 7, color: '#000', weight: 1.5, fillColor: '#ff6d00', fillOpacity: 1 })
       .bindTooltip(`dead end of street ${sid === null ? '?' : sid} - click to prolong it`)
@@ -1191,7 +1654,7 @@ function drawDrawLayers() {
     const line = L.polyline(d.pts, { color: '#00e5ff', weight: 5, dashArray: '8 6', interactive: false }).addTo(G.roadEdges);
     d.pts.forEach((p, i) => {
       // The fixed start of a prolongation must stay on its original node.
-      const fixed = ((d.mode === 'prolong' || d.mode === 'route') && i === 0) || (d.mode === 'route' && d.reached && i === d.pts.length-1) || (d.mode === 'reshape' && (i === 0 || i === d.pts.length - 1));
+      const fixed = ((d.mode === 'prolong' || isPlannedRoute(d)) && i === 0) || (isPlannedRoute(d) && d.reached && i === d.pts.length-1) || (d.mode === 'reshape' && (i === 0 || i === d.pts.length - 1));
       const marker = L.marker(p, { draggable: !fixed && !d.saving && d.tool !== 'freehand', icon: L.divIcon({ className: `road-vertex${fixed ? i === 0 ? ' road-start' : ' road-end' : ''}`, iconSize: [12, 12], iconAnchor: [6, 6] }) }).addTo(G.roadEdges);
       marker.bindTooltip(fixed ? i === 0 ? 'Fixed start junction (green)' : 'Fixed end junction (red)' : 'Drag to reshape; right-click to remove');
       marker.on('drag', () => { const ll = marker.getLatLng(); d.pts[i] = [ll.lat, ll.lng]; d.snaps[i] = null; line.setLatLngs(d.pts); });
@@ -1216,23 +1679,24 @@ function drawDrawLayers() {
 }
 function panelDraw() {
   const d = S.draw, n = d.pts.length;
-  const msg = d.mode === 'prolong' && !d.start ? 'Click a dead end (orange dot) of the road to prolong.' : d.tool === 'freehand' ? 'Hold the left mouse button and trace the road. Release to adjust the points; Finish saves it.' : d.mode === 'reshape' ? 'Drag the white points to follow the visible road. Click a small midpoint to insert a bend; right-click a white point to remove it.' : 'Click along the road to add bends. Drag a point to reshape; click a small midpoint to insert a bend; right-click a point to remove it.';
+  const msg = d.mode === 'prolong' && !d.start ? 'Click a dead end (orange dot) of the road to prolong.' : d.tool === 'freehand' ? 'Hold the left mouse button and trace the road. Release to adjust the points; Finish saves it.' : isReshapeMode(d) ? 'Drag the white points to follow the visible road. Click a small midpoint to insert a bend; right-click a white point to remove it.' : 'Click along the road to add bends. Drag a point to reshape; click a small midpoint to insert a bend; right-click a point to remove it.';
   const sel = (id, opts, cur) => I18n.html`<select id="${id}">${opts.map(([v, t]) => I18n.html`<option value="${v}" ${String(cur) === String(v) ? 'selected' : ''}>${I18n.t(t)}</option>`).join('')}</select>`;
   const triOpts = [['null', 'unknown'], ['true', 'yes'], ['false', 'no']];
-  return I18n.html`<h3>${I18n.t(d.mode === 'route' ? 'Trace a connected route' : d.mode === 'reshape' ? 'Reshape existing road' : d.mode === 'new' ? 'Draw a new road' : 'Prolong a road end')}</h3><p>${d.mode === 'route' && d.phase !== 'trace' ? d.phase === 'start' ? I18n.t('Click the starting point.') : I18n.t('Click the planned ending point. This does not draw a connecting line.') : I18n.t(msg)}</p>
+  return I18n.html`<h3>${I18n.t(d.mode === 'route' ? 'Trace a connected route' : isReshapeMode(d) ? d.mode === 'reshape-partial' ? 'Reshape selected road portion' : 'Reshape existing road' : d.mode === 'new' ? 'Draw a new road' : 'Prolong a road end')}</h3><p>${d.mode === 'route' && d.phase !== 'trace' ? d.phase === 'start' ? I18n.t('Click the starting point.') : I18n.t('Click the planned ending point. This does not draw a connecting line.') : I18n.t(msg)}</p>
     ${d.mode === 'route' && d.phase === 'trace' ? I18n.htmlText('<p>Each stroke must start at the last point. The planned end remains separate until reached. Stop and flag uncertainty where the visible path disappears.</p>') : ''}
-    ${d.mode === 'reshape' ? I18n.htmlText('<p>Move the white points or insert bends between the fixed junctions. Orange shows the previous shape. Freehand replaces the interior; trace from the first endpoint toward the last. Saving does not add another road. A crossing does not create a new junction.</p>') : ''}
+    ${d.mode === 'reshape' ? I18n.htmlText('<p>Move the white points or insert bends between the fixed junctions. Orange shows the previous shape. Freehand replaces the interior while keeping both junctions.</p>') : ''}
+    ${d.mode === 'reshape-partial' ? I18n.htmlText('<p>Orange is the old portion. Trace a completely new cyan route from the green A anchor to the planned B endpoint. Saving replaces the orange portion; it does not add a road.</p><button data-act="partial-change-anchors">Change anchors A and B</button>') : ''}
     <p><label>Drawing <select id="draw-tool" ${d.phase !== 'trace' ? 'disabled' : ''}><option value="points" ${d.tool === 'points' ? 'selected' : ''}>Click points</option><option value="freehand" ${d.tool === 'freehand' ? 'selected' : ''}>Freehand trace</option></select></label></p>
-    ${d.mode === 'reshape' ? '' : I18n.html`<p><label><input type="checkbox" id="draw-snap" ${d.snap ? 'checked' : ''}> Snap to existing roads</label></p>`}
-    <p class="muted">${n} points. Freehand mode uses dragging to draw; switch to Click points to pan the map.${d.mode === 'reshape' ? ' Existing junctions stay fixed.' : ' With snapping off, new ends stay unconnected.'}</p>
+    ${isReshapeMode(d) ? '' : I18n.html`<p><label><input type="checkbox" id="draw-snap" ${d.snap ? 'checked' : ''}> Snap to existing roads</label></p>`}
+    <p class="muted">${n} points. Freehand mode uses dragging to draw; switch to Click points to pan the map.${isReshapeMode(d) ? ' Use Change anchors if A or B is misplaced.' : ' With snapping off, new ends stay unconnected.'}</p>
     ${d.mode === 'prolong' && d.join !== null ? I18n.html`<p class="muted">The new part becomes part of street ${d.join}.</p>` : ''}
-    ${d.mode === 'reshape' ? '' : I18n.html`<p><input type="text" id="draw-name" placeholder="Name (optional)" value="${esc(d.name)}"></p>`}
+    ${isReshapeMode(d) ? '' : I18n.html`<p><input type="text" id="draw-name" placeholder="Name (optional)" value="${esc(d.name)}"></p>`}
     ${d.mode === 'new' || d.mode === 'route' ? I18n.html`<table class="form"><tr><td>Rank</td><td>${sel('draw-rank', RANK_NAMES.map((t, i) => [i, t]), d.rank)}</td></tr>
       <tr><td>Drivable</td><td>${sel('draw-drv', triOpts, d.drivable)}</td></tr><tr><td>Paved</td><td>${sel('draw-paved', triOpts, d.paved)}</td></tr></table>` : ''}
-    ${d.mode !== 'reshape' ? I18n.html`<p><label><input type="checkbox" id="draw-uncertain" ${d.uncertain ? 'checked' : ''}> Stop here: path beyond this point is unclear</label></p>` : ''}
+    ${!isReshapeMode(d) || d.mode === 'reshape-partial' ? I18n.html`<p><label><input type="checkbox" id="draw-uncertain" ${d.uncertain ? 'checked' : ''}> ${d.mode === 'reshape-partial' ? 'Path beyond anchor B is unclear' : 'Stop here: path beyond this point is unclear'}</label></p>` : ''}
     <div class="row"><button class="primary" data-act="draw-finish" ${n < 2 ? 'disabled' : ''}>Finish</button><button data-act="draw-again" ${n < 2 ? 'disabled' : ''}>Finish and recompute ids</button><button class="danger" data-act="draw-cancel">Cancel</button></div>
     ${d.strokeHistory.length ? I18n.htmlText('<button data-act="draw-undo-stroke">Undo last stroke</button>') : ''}
-    <div class="row">${d.mode === 'reshape' ? I18n.htmlText('<button data-act="reshape-reset">Reset draft</button>') : I18n.html`<button data-act="draw-undo" ${n < 1 || (d.mode === 'prolong' && n < 2) ? 'disabled' : ''}>Remove last point</button>`}<span class="muted">Enter finishes &middot; Esc cancels</span></div>`;
+    <div class="row">${d.mode === 'reshape' ? '' : I18n.html`<button data-act="draw-undo" ${n < 1 || ((d.mode === 'prolong' || isPlannedRoute(d)) && n < 2) ? 'disabled' : ''}>Remove last point</button>`}${isReshapeMode(d) ? I18n.htmlText('<button data-act="reshape-reset">Reset trace</button>') : ''}<span class="muted">Enter finishes &middot; Esc cancels</span></div>`;
 }
 function panelDelete() {
   const d = S.del, n = d.sel.size, gone = S.edgeData ? S.edgeData.removed.features.length : 0;
@@ -1241,16 +1705,47 @@ function panelDelete() {
     <div class="row"><button class="danger" data-act="del-apply" ${n ? '' : 'disabled'}>Delete the ${n} selected</button><button data-act="del-clear" ${n ? '' : 'disabled'}>Clear selection</button><button data-act="del-done">Done</button></div>
     <p class="muted">One undo step; the ids update by themselves.</p>`;
 }
+function drawEdgeAccessDraft() {
+  const d = S.edgeAccess; if (!d) return;
+  G.hl.clearLayers();
+  if (d.result) {
+    const route = d.result.routes[d.route || 0];
+    L.geoJSON(route.geometry, { style: { color: '#00b8d4', weight: 8, opacity: .9 }, interactive: false }).addTo(G.hl);
+    [['A', d.result.a], ['B', d.result.b]].forEach(([label, p]) => L.circleMarker([p.lat, p.lon], { radius: 7, color: '#fff', weight: 2, fillColor: label === 'A' ? '#2e7d32' : '#d84315', fillOpacity: 1 }).bindTooltip(`${label} · node ${p.node}`, { permanent: true }).addTo(G.hl));
+  } else if (d.a) {
+    L.circleMarker([d.a.lat, d.a.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#2e7d32', fillOpacity: 1 }).bindTooltip('A', { permanent: true }).addTo(G.hl);
+  }
+  G.hl.addTo(map);
+}
+function panelEdgeAccess() {
+  const d = S.edgeAccess, result = d.result, route = result && result.routes[d.route || 0];
+  return I18n.html`<h3>Drivable from A to B</h3>
+    ${!d.a ? I18n.htmlText('<p>Click A on or near a road. It will snap to the nearest network node.</p>') : !result ? I18n.htmlText('<p>Now click B. The shortest existing route will be calculated without moving or splitting roads.</p>') : I18n.html`<p><strong>${fmt(route.length_m, 1)} m</strong> · ${route.refs.length} edges · node ${result.a.node} → ${result.b.node}</p>
+      ${result.routes.length > 1 ? I18n.html`<button data-act="edge-access-other">${d.route ? 'Use shortest route' : 'Other route'} · ${fmt(result.routes[d.route ? 0 : 1].length_m, 1)} m</button>` : I18n.htmlText('<p class="muted">No other node-distinct route exists between A and B.</p>')}
+      <label>Drivable<select id="edge-access-value"><option value="car">Yes</option><option value="foot">No (foot or motorbike)</option><option value="unknown">Unknown</option></select></label>
+      <div class="row"><button class="primary" data-act="edge-access-save">Save classification</button><button data-act="edge-access-restart">Choose A and B again</button><button data-act="edge-access-cancel">Cancel</button></div>
+      <p class="muted">This changes drivable only; roads do not move. Street IDs are recalculated at the next Compute.</p>`}
+    ${d.a && !result ? I18n.htmlText('<button data-act="edge-access-restart">Choose A again</button> <button data-act="edge-access-cancel">Cancel</button>') : !d.a ? I18n.htmlText('<button data-act="edge-access-cancel">Cancel</button>') : ''}`;
+}
 function panelRoads() {
+  if (S.edgeAccess) return panelEdgeAccess();
   if (S.join) return I18n.htmlText('<h3>Connect roads</h3><p>Choose a free endpoint A or B, then click the target road. A shared junction connects routing; street ID grouping is separate.</p><button data-act=join-cancel>Cancel connection</button>');
-  if (S.reshapePick) return I18n.html`<h3>${S.reshapePick.action === 'cut' ? 'Remove part of a road' : 'Reshape an existing road'}</h3><p>Click a cyan road section${S.reshapePick.action === 'cut' ? ', then choose two cut points.' : ' to adjust its bends. Junction endpoints stay fixed.'}</p><button data-act="reshape-cancel">Cancel</button>`;
-  if (S.cut) return I18n.html`<h3>Remove part of a road</h3><p>Choose two positions along this section. The portion between them appears in red; the rest stays.</p>
-    ${S.cut.preview ? I18n.html`<p><strong>${fmt(S.cut.preview.properties.removed_m, 1)} m</strong> to remove; ${S.cut.preview.properties.retained_parts} outside parts retained. A gap can disconnect the network.</p>` : I18n.html`<p>${S.cut.points.length} of 2 cut points chosen.</p>`}
-    <button class="danger" data-act="cut-save" ${!S.cut.preview || S.cut.busy ? 'disabled' : ''}>Delete red portion</button><button data-act="cut-reset">Reset cut points</button><button data-act="cut-cancel">Cancel</button>`;
+  if (S.reshapePick) return I18n.html`<h3>${S.reshapePick.action === 'review' ? 'Mark an unclear road portion' : S.reshapePick.action === 'cut' ? 'Remove part of a road' : 'Reshape an existing road'}</h3><p>Click a cyan road section${S.reshapePick.action === 'review' ? ', then choose where the unclear interval starts and ends.' : S.reshapePick.action === 'cut' ? ', then choose two cut points.' : ' to adjust its bends. Junction endpoints stay fixed.'}</p><button data-act="reshape-cancel">Cancel</button>`;
+  if (S.cut) return S.cut.review
+    ? I18n.html`<h3>Mark an unclear road portion</h3><p>Click the start and end of the interval that cannot be confirmed from the imagery. This records a review mark and does not change the road.</p>
+      ${S.cut.preview ? I18n.html`<p><strong>${fmt(S.cut.preview.properties.removed_m, 1)} m</strong> selected in orange.</p><textarea id="review-note" maxlength="500" placeholder="Why is this unclear?">Road hidden or unclear in imagery</textarea>` : I18n.html`<p>${S.cut.points.length} of 2 points chosen.</p>`}
+      <button class="primary" data-act="review-save" ${!S.cut.preview || S.cut.busy ? 'disabled' : ''}>Save unclear portion</button><button data-act="cut-reset">Reset points</button><button data-act="cut-cancel">Cancel</button>`
+    : S.cut.reshape ? I18n.html`<h3>Choose the portion to reshape</h3><p>Click point A before the inaccurate bend and point B after it. The orange portion will be replaced; everything outside it stays unchanged.</p>
+      ${S.cut.preview ? I18n.html`<p><strong>${fmt(S.cut.preview.properties.selected_m, 1)} m</strong> selected between two fixed anchors.</p>` : I18n.html`<p>${S.cut.points.length} of 2 anchor points chosen.</p>`}
+      <button class="primary" data-act="partial-start" ${!S.cut.preview || S.cut.busy ? 'disabled' : ''}>Trace replacement</button><button data-act="cut-reset">Reset anchors</button><button data-act="cut-cancel">Cancel</button>`
+    : I18n.html`<h3>Remove part of a road</h3><p>Choose two positions along this section. The portion between them appears in red; the rest stays.</p>
+      ${S.cut.preview ? I18n.html`<p><strong>${fmt(S.cut.preview.properties.removed_m, 1)} m</strong> to remove; ${S.cut.preview.properties.retained_parts} outside parts retained. A gap can disconnect the network.</p>` : I18n.html`<p>${S.cut.points.length} of 2 cut points chosen.</p>`}
+      <button class="danger" data-act="cut-save" ${!S.cut.preview || S.cut.busy ? 'disabled' : ''}>Delete red portion</button><button data-act="cut-reset">Reset cut points</button><button data-act="cut-cancel">Cancel</button>`;
   if (S.draw) return panelDraw();
   if (S.stage && S.stage.pv) return panelStage();
   if (S.del) return panelDelete();
   const r = S.roads || { imports: [], report: {} }, rep = r.report || {};
+  const reviewRows = (r.reviews?.features || []).map((feature, index) => I18n.html`<tr><td>${index + 1}</td><td>${fmt(feature.properties.selected_m, 1)} m</td><td>${esc(feature.properties.note)}</td><td><button data-act="review-remove" data-id="${esc(feature.properties.id)}">Mark clear</button></td></tr>`).join('');
   const grouped = []; (r.imports || []).forEach((i) => { const g = grouped.find((x) => x.file === i.file); if (g) { g.lines += i.lines; g.ids.push(i.id); } else grouped.push({ file: i.file, lines: i.lines, ids: [i.id] }); });   // files with one name (all the roads drawn by hand) are one file
   const imports = grouped.map((i) => I18n.html`<tr><td>${esc(i.file)}</td><td>${i.lines} lines</td><td><button data-act="conn-open">Edit connections</button> <button class="danger" data-act="remove-roads" data-id="${i.ids.join(',')}">Remove</button></td></tr>`).join('');
   const dangling = (r.nodes ? r.nodes.features : []).filter((f) => rep.dangling && rep.dangling.includes(f.properties.key));
@@ -1267,7 +1762,10 @@ function panelRoads() {
       <h3>Ends not connected</h3><table><tr><th>#</th><th>nearest existing road</th></tr>${rows || I18n.htmlText('<tr><td colspan="2" class="muted">all ends are connected</td></tr>')}</table>`;
   }
   let h = I18n.html`<div class="workspace-hint"><div><strong>Right-click a road to edit</strong><small>Your edits are saved automatically. Use checkpoints before a larger change.</small></div></div>${comp}<div class="row"><label>Colour by <select id="roads-color"><option value="plain" ${S.roadColor !== 'file' ? 'selected' : ''}>one colour</option><option value="file" ${S.roadColor === 'file' ? 'selected' : ''}>file</option></select></label></div>${roadsLegend()}`;
-  h += sec('draw', 'Draw, prolong or reshape a road', I18n.htmlText('<div class="row"><button data-act="draw-route">Trace route: start → end</button><button data-act="draw-new">Draw a new road</button><button data-act="draw-prolong">Prolong a road end</button><button data-act="reshape-pick">Reshape an existing road</button></div>'), false);
+  h += sec('check', 'Road check', panelCheck(), true);
+  h += sec('access', 'Drivable', I18n.htmlText('<div class="row"><button data-act="edge-access-start">Set drivable from A to B</button></div><p class="muted">Choose A and B; the tool follows existing roads and never moves them. Colour by drivable in the Street types and IDs tab to check; OSM tracks are named in the tooltip.</p>'), false);
+  h += sec('review', 'Unclear road portions', I18n.html`<div class="row"><button data-act="review-pick">Mark an unclear portion</button></div>${reviewRows ? I18n.html`<table><tr><th>#</th><th>Length</th><th>Reason</th><th></th></tr>${reviewRows}</table>` : I18n.htmlText('<p class="muted">No road portions are currently marked unclear.</p>')}`, false);
+  h += sec('draw', 'Draw, prolong or reshape a road', I18n.htmlText('<div class="row"><button data-act="draw-route">Trace route: start → end</button><button data-act="draw-new">Draw a new road</button><button data-act="draw-prolong">Prolong a road end</button><button data-act="partial-pick">Reshape between two points</button><button data-act="reshape-pick">Reshape a whole section</button></div>'), false);
   h += sec('add', 'Add streets from a file', I18n.htmlText('<p class="muted">KML, GeoJSON, GeoPackage or zipped shapefile</p><div class="row"><input type="file" id="roads-file" accept=".kml,.geojson,.json,.gpkg,.zip,.shp"></div>'), true);
   h += sec('del', 'Delete edges', I18n.htmlText('<div class="row"><button data-act="cut-pick">Remove part of a road...</button><button data-act="del-start">Select whole edges to delete...</button></div>'), false);
   h += sec('data', 'Street data and Google Earth', I18n.htmlText('<div class="row"><a class="btn" href="api/export/streets.csv" download="streets.csv">&#11015; Street data CSV</a><a class="btn" href="api/export/edges.kml" download>&#11015; Streets KML</a></div><p class="muted">Upload an edited street data CSV (rank, drivable, paved):</p><div class="row"><input type="file" id="attrs-file" accept=".csv"></div>'), false);
@@ -1276,17 +1774,32 @@ function panelRoads() {
 }
 
 /* ---------------------------------------------------------------- panel actions (event delegation) */
+async function reloadAddresses() {                                 // after an approval: the register changes the addresses shown, not the computation
+  await refreshProject(); S.addresses = await api('/addresses');
+  if (S.sel && S.sel.type === 'house') { const f = S.addresses.houses.features.find((x) => x.properties.building_id === S.sel.props.building_id); if (f) S.sel.props = f.properties; }
+  drawTab(); renderPanel();
+}
 const ACT = {
   compute: () => startCompute('network'),
   'compute-addresses': () => startCompute('addresses'),
   select: (b) => selectStreet(+b.dataset.id),
   'goto-plan': (b) => selectStreet(+b.dataset.id),
+  'check-run': async () => { toast('Checking the roads...'); await runCheck(); },
+  'check-zoom': (b) => zoomCheck(+b.dataset.n),
+  'check-ok': async (b) => { await api('/roads/check/ok', { ids: [b.dataset.id], ok: b.dataset.ok === '1' }); await refreshProject(); await runCheck(); },
+  'check-close': () => { S.check = null; S.checkFocus = null; G.check.clearLayers(); G.hl.clearLayers(); renderPanel(); },
   'plan-all': () => { S.planAll = !S.planAll; renderPanel(); },
   'set-name': async (b) => { const typed = $('#name-input').value.trim(), name = typed || '0'; /* an empty box deletes the name */ const old = (S.project.names || {})[b.dataset.id] || null; try { await api('/names', { street_id: +b.dataset.id, name, expected: old, user: user() }); } catch (err) { if (err.status !== 409) throw err; const cur = err.detail.current; if (!confirm(`Someone just changed this street to "${cur || '(no name)'}". Replace it with "${name}"?`)) { await refreshProject(); renderPanel(); return; } await api('/names', { street_id: +b.dataset.id, name, expected: cur, user: user() }); } await afterEdit(); toast('Name saved.'); renderPanel(); },
   'delete-name': async (b) => { await api('/names', { street_id: +b.dataset.id, name: '0', user: user() }); await afterEdit(); toast('Name deleted'); renderPanel(); },
   'clear-name': async (b) => { await api('/names', { street_id: +b.dataset.id, name: '', user: user() }); await afterEdit(); toast('Name removed'); renderPanel(); },
-  'apply-settings': async () => { await api('/settings', { max_levels: +$('#set-levels').value, second_level_max_drive_m: +$('#set-deep').value, house_step_m: +$('#set-house').value, branch_step_m: +$('#set-branch').value, max_house_distance_m: +$('#set-dist').value, connect_backbone: $('#set-conn').checked, user: user() }); await afterEdit(); toast('Settings changed. Compute to apply.'); renderPanel(); },
+  'apply-settings': async () => { await api('/settings', { house_step_m: +$('#set-house').value, branch_step_m: +$('#set-branch').value, max_house_distance_m: +$('#set-dist').value, connect_backbone: $('#set-conn').checked, user: user() }); await afterEdit(); toast('Settings changed. Compute to apply.'); renderPanel(); },
   'pick-access': (b) => setMode('access', { id: b.dataset.id }),
+  'approve-house': async (b) => { const r = await api('/register/approve', { ids: [b.dataset.id] }); toast(r.approved ? 'Address validated: it changes only when you validate a change.' : 'Not validated: the address is not complete.', 4000); await reloadAddresses(); },
+  'approve-area': async (b) => { if (!confirm(I18n.msg`Validate every complete address in ${b.dataset.id}?`)) return; const r = await api('/register/approve', { area: b.dataset.id }); toast(I18n.msg`${r.approved} validated, ${r.unchanged} already validated, ${r.skipped} not complete.`, 6000); await reloadAddresses(); },
+  'correct-house': async (b) => { const reason = prompt(I18n.t('Why does the address change? (kept in its history and in the list of families to inform)')); if (!reason || !reason.trim()) return; await api('/register/approve', { ids: [b.dataset.id], correct: true, reason }); toast('Change validated. The family is on the list to inform.', 4000); await reloadAddresses(); },
+  'set-quartier': async (b) => { const q = $('#house-quartier').value; await api('/houses/quartier', { ids: [b.dataset.id], quartier: q }); toast(q ? I18n.msg`Quartier set to ${q}. Compute the addresses to apply.` : 'Quartier back to the survey. Compute the addresses to apply.', 5000); await refreshProject(); renderPanel(); },
+  'validate-changes': async () => { const reason = prompt(I18n.t('Why do these addresses change? (kept in their history and in the list of families to inform)')); if (!reason || !reason.trim()) return; const r = await api('/register/approve', { changed: true, correct: true, reason }); toast(I18n.msg`${r.corrected} changes validated. Download the list of families to inform.`, 6000); await reloadAddresses(); },
+  'retire-house': async (b) => { const reason = prompt(I18n.t('Why is this address retired? (e.g. house demolished)')); if (!reason || !reason.trim()) return; await api('/register/retire', { ids: [b.dataset.id], reason }); toast('Address retired. Its number and code will never be given again.', 5000); await reloadAddresses(); },
   'clear-access': async (b) => { await api('/access', { building_id: b.dataset.id, clear: true, user: user() }); await afterEdit(); toast('Back to the nearest road.'); renderPanel(); },
   'remove-roads': async (b) => { const ids = b.dataset.id.split(','); if (ids.length > 1 && !confirm(`Remove all ${ids.length} parts of this file?`)) return; for (const id of ids) await api('/roads/remove', { id: +id, user: user() }); await afterEdit(); await loadRoads(); drawTab(); },
   'zoom-part': (b) => { const fs = S.components.edges.features.filter((f) => f.properties.part === +b.dataset.part); if (fs.length) map.fitBounds(L.geoJSON(fs).getBounds().pad(0.3)); },
@@ -1312,10 +1825,53 @@ const ACT = {
   'draw-route': () => startDraw('route'),
   'draw-undo-stroke': () => { const d = S.draw, previous = d.strokeHistory.pop(); if (previous) { d.pts = previous.pts; d.snaps = previous.snaps; d.reached = previous.reached; drawTab(); } },
   'reshape-pick': () => pickRoadToReshape(),
+  'partial-pick': () => pickRoadToReshape('partial'),
+  'review-pick': () => pickRoadToReshape('review'),
   'cut-pick': () => pickRoadToReshape('cut'),
   'join-cancel': cancelJoin,
   'cut-cancel': () => { S.cut = null; setMode(null); drawTab(); },
   'cut-reset': () => { if (S.cut && !S.cut.busy) { S.cut.points = []; S.cut.preview = null; S.cut.whole = false; drawTab(); } },
+  'review-save': async () => {
+    const c = S.cut; if (!c?.review || !c.preview || c.busy) return;
+    c.busy = true;
+    try {
+      await api('/roads/review', { ref: c.feature.properties.ref, points: c.points, note: $('#review-note').value.trim(), revision: c.revision });
+      S.cut = null; setMode(null); await afterEdit(); await loadRoads(); drawTab(); toast('Unclear road portion saved.');
+    } finally { c.busy = false; }
+  },
+  'review-remove': async (b) => {
+    await api('/roads/review/remove', { ids: [b.dataset.id], revision: S.rev });
+    await afterEdit(); await loadRoads(); drawTab(); toast('Road portion marked clear.');
+  },
+  'edge-access-start': () => { S.edgeAccess = { a: null, result: null, route: 0 }; setMode('edge-access', {}); drawTab(); },
+  'edge-access-restart': () => { S.edgeAccess = { a: null, result: null, route: 0 }; setMode('edge-access', {}); drawTab(); },
+  'edge-access-other': () => { S.edgeAccess.route = S.edgeAccess.route ? 0 : 1; drawTab(); },
+  'edge-access-cancel': () => { S.edgeAccess = null; setMode(null); G.hl.clearLayers(); drawTab(); },
+  'edge-access-save': async () => {
+    const d = S.edgeAccess, route = d && d.result && d.result.routes[d.route || 0]; if (!route) return;
+    const picked = $('#edge-access-value').value, value = picked === 'unknown' ? null : picked;
+    await api('/edges/access', { refs: route.refs, access: value, revision: d.result.revision });
+    S.edgeAccess = null; setMode(null); await afterEdit(); await loadRoads(); drawTab(); toast('Drivable saved.');
+  },
+  'partial-start': () => {
+    const selection = S.cut; if (!selection?.reshape || !selection.preview) return;
+    const old = selection.preview.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+    const anchors = selection.preview.properties.anchors;
+    S.cut = null;
+    startDraw('reshape-partial');
+    Object.assign(S.draw, { ref: selection.feature.properties.ref, revision: selection.revision, snap: false,
+      anchors, original: old.map(point => [...point]), pts: [[anchors[0][1], anchors[0][0]]],
+      target: [anchors[1][1], anchors[1][0]], reached: false,
+      partialSelection: { feature: selection.feature, revision: selection.revision } });
+    S.draw.snaps = S.draw.pts.map(() => null); drawTab();
+  },
+  'partial-change-anchors': () => {
+    const d = S.draw; if (!d || d.mode !== 'reshape-partial') return;
+    const selection = d.partialSelection;
+    stopDraw();
+    S.cut = { feature: selection.feature, revision: selection.revision, points: [], reshape: true };
+    setMode('cut'); drawTab();
+  },
   'cut-save': async () => {
     const c = S.cut; if (!c || !c.preview || c.busy) return;
     if (!confirm(I18n.msg`Delete only the red ${fmt(c.preview.properties.removed_m, 1)} m? This may create a network gap. You can Undo.`)) return;
@@ -1324,11 +1880,15 @@ const ACT = {
     finally { c.busy = false; }
   },
   'reshape-cancel': () => { S.reshapePick = null; drawTab(); },
-  'reshape-reset': () => { const d = S.draw; d.pts = d.original.map(p => [...p]); d.snaps = d.pts.map(() => null); drawTab(); },
+  'reshape-reset': () => {
+    const d = S.draw;
+    d.pts = d.mode === 'reshape-partial' ? [[d.anchors[0][1], d.anchors[0][0]]] : d.original.map(p => [...p]);
+    d.snaps = d.pts.map(() => null); d.reached = false; d.strokeHistory = []; drawTab();
+  },
   'draw-prolong': () => startDraw('prolong'),
   'draw-finish': () => finishDraw(),
   'draw-again': () => finishDraw(true),
-  'draw-undo': () => { if (S.draw && S.draw.pts.length && !(S.draw.mode === 'route' && S.draw.pts.length === 1)) { S.draw.pts.pop(); S.draw.snaps.pop(); S.draw.reached = false; if (!S.draw.pts.length && S.draw.mode === 'prolong') { S.draw.start = null; S.draw.join = null; } drawTab(); } },
+  'draw-undo': () => { if (S.draw && S.draw.pts.length && !(isPlannedRoute(S.draw) && S.draw.pts.length === 1)) { /* the start of a route and anchor A of a partial reshape stay */ S.draw.pts.pop(); S.draw.snaps.pop(); S.draw.reached = false; if (!S.draw.pts.length && S.draw.mode === 'prolong') { S.draw.start = null; S.draw.join = null; } drawTab(); } },
   'draw-cancel': () => stopDraw(),
   'del-start': () => { S.del = { sel: new Set() }; drawTab(); },
   'del-clear': () => { S.del.sel.clear(); drawTab(); },
@@ -1376,8 +1936,9 @@ $('#panel').addEventListener('input', (e) => {
   if (e.target.id !== 'addr-search' || !S.addresses) return;
   const q = e.target.value.trim().toLowerCase(); const out = $('#addr-results');
   if (q.length < 2) { out.innerHTML = ''; return; }
-  const hits = S.addresses.houses.features.filter((f) => ((f.properties.address || '') + ' ' + f.properties.building_id).toLowerCase().includes(q)).slice(0, 12);
-  out.innerHTML = I18n.html`<table>${hits.map((f) => I18n.html`<tr class="click" data-act="goto-house" data-id="${esc(f.properties.building_id)}"><td>${esc(f.properties.address || f.properties.building_id)}</td></tr>`).join('')}</table>`;
+  const p_ = (f) => f.properties;                                  // address (TCK 0575 0230 or written), name on the plaque, survey id
+  const hits = S.addresses.houses.features.filter((f) => [p_(f).plate, p_(f).address, p_(f).plaque_name, p_(f).address_id, p_(f).building_id].join(' ').toLowerCase().includes(q)).slice(0, 15);
+  out.innerHTML = hits.length ? I18n.html`<table>${hits.map((f) => I18n.html`<tr class="click" data-act="goto-house" data-id="${esc(p_(f).building_id)}"><td>${esc(p_(f).plate || p_(f).address || p_(f).address_id || p_(f).building_id)}</td><td class="muted">${esc(p_(f).plaque_name || p_(f).address_id || '')}${p_(f).plate ? '' : I18n.html` <span class="badge warn">${p_(f).quartier_code ? 'no plate yet' : 'no plate: quartier unknown'}</span>`}</td></tr>`).join('')}</table>` : I18n.htmlText('<p class="muted">Nothing found.</p>');
 });
 ACT['goto-point'] = (b) => { map.setView([+b.dataset.lat, +b.dataset.lon], 18); };
 ACT['goto-house'] = (b) => { const f = S.addresses.houses.features.find((x) => x.properties.building_id === b.dataset.id); if (!f) return; const c = L.geoJSON(f).getBounds().getCenter(); map.setView(c, 19); S.sel = { type: 'house', props: f.properties, ll: c }; drawAccess(f.properties); renderPanel(); refreshSel(); };
@@ -1397,8 +1958,15 @@ document.querySelector('.menu-body').addEventListener('click', async (e) => {
 $('#btn-undo').onclick = async () => { await api('/undo', {}); await afterEdit(); if (S.tab === 'roads') await loadRoads(); drawTab(); };
 $('#btn-redo').onclick = async () => { await api('/redo', {}); await afterEdit(); if (S.tab === 'roads') await loadRoads(); drawTab(); };
 async function computeAndWait() {
+  S.computeStartedAt = Date.now(); showComputeStatus('Updating the map');
   await api('/compute', {}).catch(() => null);
-  for (;;) { const j = await api('/job'); $('#job').textContent = `computing: ${j.step || ''}...`; if (j.state !== 'running') { if (j.state === 'error') throw new Error(j.error); return; } await new Promise((r) => setTimeout(r, 700)); }
+  try {
+    for (;;) {
+      const j = await api('/job'); $('#job').textContent = `computing: ${j.step || ''}...`;
+      if (j.state !== 'running') { if (j.state === 'error') throw new Error(j.error); showComputeStatus('Loading the completed map'); return; }
+      showComputeStatus(j.step); await new Promise((r) => setTimeout(r, 700));
+    }
+  } finally { hideComputeStatus(); }
 }
 $('#btn-save').onclick = async () => {
   const label = prompt('Describe this checkpoint (optional):', ''); if (label === null) return;
@@ -1472,7 +2040,7 @@ function askReference(force) {
   S.referenceView={kind:'ask'};
   const what = r.name ? I18n.html`<strong>${esc(r.name)}</strong> (node ${r.node})` : `node ${r.node}`;
   showRefOnly(r);
-  map.setView([r.lat, r.lon], 17);
+  map.setView([r.lat, r.lon], 17, { animate: false });     // no animation: a view restored right after must not be undone when it ends
   refBox().hidden = false;
   refBox().innerHTML = I18n.html`<img class="reference-logo" src="static/brand/community-addressing-cameroon.png" alt="Community Addressing Cameroon"><div class="refbox-title">Reference point</div><p>${I18n.msg`The numbering of every street and house starts at the star on the map: ${what}, ${I18n.t(r.default ? 'the default point of this project' : 'set by another editor')}.`}</p>
     <p><strong>Is this the right place?</strong></p><div class="row"><button class="primary" id="ref-confirm">Yes, confirm it</button><button id="ref-move">No, I will move it</button></div>`;
@@ -1511,9 +2079,15 @@ async function initApp() {
   try { S.network = await api('/network'); } catch (e) { /* computing or not yet */ }
   let issues = false;                                        // graph problems (cut-off parts, roads not connected): start on the street editor
   try { issues = (await api('/base/components')).parts.length > 0 || ((S.network && S.network.warnings) || []).some((w) => ['disconnected', 'roads_isolated'].includes(w.code)); } catch (e) { /* no network yet */ }
-  await switchTab(issues ? 'roads' : 'ids');
+  const saved = savedView();                                 // where this browser was before the refresh
+  if (saved) { S.idColor = saved.idColor || S.idColor; S.fittedRoads = true; }
+  await switchTab(saved && ['roads', 'ids', 'names', 'addresses'].includes(saved.tab) ? saved.tab : issues ? 'roads' : 'ids');
+  if (saved && saved.quartier && quartierFeatures().some(f => f.properties.id === saved.quartier)) chooseQuartier(saved.quartier);
+  else if (saved && saved.area && (S.project.work_areas?.features || []).some(f => f.properties.id === saved.area)) chooseWorkArea(saved.area);
   S.fitted = true;                                           // the view is set once at the start; later recomputations never move it
-  if (S.network) map.setView([S.project.reference.lat, S.project.reference.lon], 16); else if (j.state === 'running') pollJob('network'); else startCompute('network');
+  if (saved) map.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+  else if (S.network) map.setView([S.project.reference.lat, S.project.reference.lon], 16);
+  if (!S.network) { if (j.state === 'running') pollJob('network'); else startCompute('network'); }
   if (j.state === 'running') pollJob(j.kind || 'network');
   S.ready = true;
 }

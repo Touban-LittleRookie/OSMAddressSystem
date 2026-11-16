@@ -387,6 +387,7 @@ def plan_minimal_naming(
     time_limit_s: float = 60.0,
     reference_node=None,
     use_length_rule: bool = True,
+    own_name_max_rank: int | None = None,
 ) -> NamingPlan:
     """Find the fewest streets to name by hand so every target street has a name or a derived name.
 
@@ -406,6 +407,7 @@ def plan_minimal_naming(
         reference_node: Node id of the reference point. When given, the named streets (existing and chosen) must be
             connected to it through named streets only (see the module docstring).
         use_length_rule: A derived street must be shorter than its main street.
+        own_name_max_rank: Streets with ``street_rank`` at most this cannot be derived and must be named by hand (None = no rule).
 
     Returns:
         The :class:`NamingPlan`.
@@ -415,7 +417,8 @@ def plan_minimal_naming(
     """
     if method not in ("auto", "exact", "greedy"):
         raise ValueError(f"method must be 'auto', 'exact' or 'greedy', got {method!r}")
-    parents = branch_parents(nodes_gdf, edges_gdf, streets_df, only_drivable=only_drivable, use_length_rule=use_length_rule)
+    parents = branch_parents(nodes_gdf, edges_gdf, streets_df, only_drivable=only_drivable, use_length_rule=use_length_rule,
+                             own_name_max_rank=own_name_max_rank)
     children = _children(parents)
     deep_ok = second_level_streets(nodes_gdf, edges_gdf, streets_df, second_level_max_drive_m)
     info = streets_df.set_index("street_id")

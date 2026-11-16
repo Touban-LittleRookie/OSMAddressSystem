@@ -43,9 +43,13 @@ POST_CAPS={
  '/api/names':'names','/api/compute':'compute','/api/addresses/compute':'compute',
  '/api/reference/confirm':'confirm','/api/reference':'admin','/api/settings':'admin','/api/restore':'admin',
  '/api/undo':'undo','/api/redo':'undo','/api/save':'checkpoint',
- '/api/access':'access','/api/access/snap':'access','/api/points/rank':'attributes','/api/streets/attrs':'attributes','/api/streets/attrs/import':'attributes','/api/streets/assign':'geometry',
+ '/api/access':'access','/api/houses/quartier':'attributes','/api/access/snap':'access','/api/points/rank':'attributes','/api/streets/attrs':'attributes','/api/streets/attrs/import':'attributes','/api/edges/access/path':'attributes','/api/edges/access':'attributes','/api/streets/assign':'geometry',
  '/api/work-areas/grid':'geometry','/api/work-areas/status':'areas',
+ '/api/work-areas/quartiers/preview':'areas','/api/work-areas/quartiers':'geometry',
+ '/api/work-areas/boundary':'geometry',
+ '/api/roads/stale/clear':'geometry',
 }
+PRIVATE_GETS=('/api/households/','/api/register/changes.csv')   # survey contacts (names, phones): administrators only
 PUBLIC_AUTH={'/api/auth/status','/api/auth/setup','/api/auth/login','/api/auth/activate','/api/auth/invite/preview'}
 MAX_AGE=8*3600
 IDLE_AGE=30*60
@@ -337,6 +341,7 @@ class Accounts:
                     if not actor:raise HTTPException(401,'Sign in to this project.')
                     caps=CAPS[actor['role']]
                     if path in ('/api/audit','/api/history') and 'audit' not in caps:raise HTTPException(403,'History access requires an editor account.')
+                    if path.startswith(PRIVATE_GETS) and 'admin' not in caps:raise HTTPException(403,'Contact details are for administrators only.')
                     if request.method not in ('GET','HEAD','OPTIONS'):
                         supplied=request.headers.get('x-csrf-token','')
                         if not hmac.compare_digest(supplied.encode(),request.state.session['csrf'].encode()):raise HTTPException(403,'Session check failed. Refresh your sign-in.')

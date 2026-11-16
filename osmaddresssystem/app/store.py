@@ -21,6 +21,7 @@ whole history stays readable.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from sqlalchemy import event
 
-from .project import Project, Settings
+from .project import ADDRESSING_RULE_VERSION, Project, Settings
 from .identity import audit_identity
 
 SCHEMA_VERSION = "3"
@@ -57,6 +58,24 @@ audit_t = sa.Table('audit',metadata,sa.Column('id',sa.Integer,primary_key=True,a
                    sa.Column('action',sa.String(40),nullable=False),sa.Column('street',sa.Integer),
                    sa.Column('before',sa.Text),sa.Column('after',sa.Text),sa.Column('details',sa.Text,nullable=False))
 closed_redo_t = sa.Table('closed_redo',metadata,sa.Column('event_id',sa.Integer,primary_key=True))
+
+
+def address_code(n: int, prefix: str = "FTN") -> str:
+    """The permanent code of the n-th approved address, with a Luhn check digit (``FTN-000123-0``).
+
+    Args:
+        n: Sequence number (from 1; never reused).
+        prefix: Community prefix.
+
+    Returns:
+        The code.
+    """
+    digits = f"{int(n):06d}"
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch) * (2 if i % 2 == 0 else 1)
+        total += d - 9 if d > 9 else d
+    return f"{prefix}-{digits}-{(10 - total % 10) % 10}"
 
 
 class Conflict(Exception):
@@ -141,6 +160,12 @@ class Store:
                                 details={'legacy':True,'undone_at_migration':bool(ev['undone']),'original_ts':ev['ts']})
                 c.execute(meta_t.insert().values(key='audit_migrated',value='1'))
                 c.execute(meta_t.update().where(meta_t.c.key=='schema').values(value=SCHEMA_VERSION))
+            if c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "replay_base")).first() is None:
+                # The road edits made so far keep the result they have now (one replay of the whole history); every later
+                # edit is applied in order on top of the network it was made on (see ``engine.effective_base``).
+                last = c.execute(sa.select(sa.func.max(events_t.c.id)).where(events_t.c.undone.is_(False))).scalar()
+                c.execute(meta_t.insert().values(key="replay_base", value=str(int(last or 0))))
+        self._plan_cache: tuple[int, dict] | None = None
 
     # ---- state ----------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -166,7 +191,7 @@ class Store:
         """
         new = json.loads(ev["new"]) if ev["new"] is not None else None
         act = ev["action"]
-        roads = lambda: state.setdefault("roads", {"imports": [], "connections": {}, "removed": [], "removed_features": [], "keep": [], "edge_street": {}, "no_cut": [], "attrs": {}, "point_rank": {}})  # noqa: E731
+        roads = lambda: state.setdefault("roads", {"imports": [], "connections": {}, "removed": [], "removed_features": [], "keep": [], "edge_street": {}, "no_cut": [], "attrs": {}, "edge_access": {}, "point_rank": {}})  # noqa: E731
         if act == "name":
             state["names"][str(ev["street"])] = new
         elif act == "unname":
@@ -181,6 +206,11 @@ class Store:
             state.setdefault("access", {}).pop(json.loads(ev["old"])["building"], None)
         elif act == "roads_import":
             new = dict(new)
+            # Replay metadata is derived from the append-only event log.  It lets
+            # geometry replay distinguish a road redrawn after an older cut from
+            # the road version that the cut originally targeted.  Checkpoints
+            # retain it because they store this folded state.
+            new.setdefault("_event_id", int(ev["id"]))
             roads()["connections"].update(new.pop("connections", None) or {})
             roads()["keep"] = sorted(set(roads().get("keep", [])) | set(new.pop("keep", None) or []))
             roads()["imports"].append(new)
@@ -191,17 +221,87 @@ class Store:
                         f["name"] = None
         elif act == "point_rank":
             roads().setdefault("point_rank", {}).update({k: int(v) for k, v in new["ranks"].items()})
+        elif act == "house_quartier":                    # the survey quartier of a house, corrected (address trigram)
+            q = roads().setdefault("quartier", {})
+            for k, v in new["quartier"].items():
+                if v:
+                    q[k] = v
+                else:
+                    q.pop(k, None)
         elif act == "street_attrs":
             for sid_, a_ in new["attrs"].items():
                 roads().setdefault("attrs", {}).setdefault(str(sid_), {}).update(a_)
+        elif act == "edge_access":
+            access = roads().setdefault("edge_access", {})
+            for ref, value in new["edges"].items():
+                access[str(ref)] = value
         elif act == "road_geometry":
-            roads().setdefault("geometry", {})[new["ref"]] = new["coords"]
+            geometry = roads().setdefault("geometry", {})
+            if new.get("coords") is None:
+                geometry.pop(new["ref"], None)
+            else:
+                geometry[new["ref"]] = new["coords"]
+            reviews = roads().setdefault("geometry_reviews", {})
+            if new.get("uncertain_end") is None:
+                reviews.pop(new["ref"], None)
+            else:
+                reviews[new["ref"]] = new["uncertain_end"]
+        elif act == "road_stretch":                       # one reshape across several sections: their shapes and the nodes between
+            geometry, reviews = roads().setdefault("geometry", {}), roads().setdefault("geometry_reviews", {})
+            for ref, coords in new["geometry"].items():
+                if coords is None:
+                    geometry.pop(ref, None)
+                else:
+                    geometry[ref] = coords
+            moves = roads().setdefault("node_moves", {})
+            for node, point in new["nodes"].items():
+                if point is None:
+                    moves.pop(node, None)
+                else:
+                    moves[node] = point
+            for ref, review in (new.get("reviews") or {}).items():
+                if review is None:
+                    reviews.pop(ref, None)
+                else:
+                    reviews[ref] = review
+        elif act == "road_check_ok":                      # road check problems marked "OK as is" (or listed again)
+            marked = set(roads().get("check_ok", []))
+            marked = marked | set(new["ids"]) if new.get("ok", True) else marked - set(new["ids"])
+            roads()["check_ok"] = sorted(marked)
+        elif act == "road_review":
+            roads().setdefault("reviews", []).append(new)
+        elif act == "road_review_remove":
+            ids = set(new.get("ids", []))
+            roads()["reviews"] = [review for review in roads().get("reviews", []) if review.get("id") not in ids]
         elif act == "road_cut":
-            roads().setdefault("cuts", []).append(new)
+            roads().setdefault("cuts", []).append({**new, "_event_id": int(ev["id"])})
         elif act == "road_join":
-            roads().setdefault("joins", []).append(new)
+            roads().setdefault("joins", []).append({**new, "_event_id": int(ev["id"])})
+        elif act == "road_operations_remove":
+            ids = set(new.get("ids", []))
+            roads()["cuts"] = [operation for operation in roads().get("cuts", []) if operation.get("id") not in ids]
+            roads()["joins"] = [operation for operation in roads().get("joins", []) if operation.get("id") not in ids]
         elif act == "work_areas":
             state["work_areas"] = new
+        elif act == "address_approve":                   # a validated address changes only when its change is validated
+            reg = state.setdefault("register", {})
+            when, who = (ev.get("ts"), ev.get("user")) if hasattr(ev, "get") else (None, None)
+            for bid, snap in new["houses"].items():
+                cur = reg.get(bid) or {}
+                step = {"ts": when, "user": who, "action": "corrected" if cur.get("status") == "approved" else "approved",
+                        "address": snap.get("address"), "plate": snap.get("plate"), "reason": new.get("reason") or None}
+                if cur.get("status") == "approved":       # before / after, for the list of families to inform
+                    step.update({"before_address": cur.get("address"), "before_plate": cur.get("plate")})
+                reg[bid] = {**snap, "code": cur.get("code") or snap.get("code"), "status": "approved", "approved_at": when, "approved_by": who,
+                            "history": [*cur.get("history", []), step]}
+        elif act == "address_retire":                    # a demolished house: the address and its code are never given again
+            reg = state.setdefault("register", {})
+            when, who = (ev.get("ts"), ev.get("user")) if hasattr(ev, "get") else (None, None)
+            for bid in new["ids"]:
+                if bid in reg:
+                    reg[bid] = {**reg[bid], "status": "retired",
+                                "history": [*reg[bid].get("history", []), {"ts": when, "user": who, "action": "retired", "address": reg[bid].get("address"),
+                                                                          "reason": new.get("reason") or None}]}
         elif act == "edges_assign":
             roads().setdefault("edge_street", {}).update({k: int(v) for k, v in new["edges"].items()})
             roads()["no_cut"] = sorted(set(roads().get("no_cut", [])) | {int(x) for x in new.get("no_cut", [])})
@@ -223,10 +323,12 @@ class Store:
         elif act == "road_unconnect":
             roads()["connections"].pop(new["node"], None)
         elif act == "restore":
-            keep = state.get("name")
+            keep, register = state.get("name"), state.get("register")
             state.clear()
             state.update(copy.deepcopy(new))
             state["name"] = keep or state.get("name")
+            if register is not None:                   # restoring a checkpoint never takes back an approved address
+                state["register"] = register
 
     def revision(self, c=None) -> int:
         """The revision counter, increased by every change (edit, undo, redo).
@@ -276,7 +378,127 @@ class Store:
             The :class:`Project` state.
         """
         with self.engine.connect() as c:
-            return Project.from_dict(self.root, self._state(c))
+            project = Project.from_dict(self.root, self._state(c))
+            ids = c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "node_ids")).scalar()
+            project.node_ids = None if ids is None else {str(k): int(v) for k, v in json.loads(ids).items()}
+            project.replay = self._replay_plan(c)
+            return project
+
+    # The road edits that change the network itself; the others (names, ranks, drivable...) only change the state.
+    _NETWORK_ACTIONS = {"roads_import", "road_cut", "road_join", "road_geometry", "road_stretch", "edges_remove", "edges_restore",
+                        "edges_assign", "road_operations_remove", "roads_remove", "roads_unname", "road_connect",
+                        "road_connect_many", "road_unconnect"}
+
+    def _replay_plan(self, c) -> dict | None:
+        """How the road network is rebuilt: the frozen part of the history, then the later network edits in order.
+
+        The edits up to the ``replay_base`` event (or the latest restore after it) are folded and replayed together, as they
+        always were; their result does not change. Each later edit refers to the network as it was when it was made (a
+        section ``u-v-key``, a node), so it is applied on top of the edits before it, in the order they were made.
+
+        An edit that takes back something of the frozen part (restoring a deleted edge, removing an old cut...) changes the
+        frozen part instead; one that takes back a later edit removes that edit from the list.
+
+        Returns:
+            ``{"point": event id, "base_roads": roads state of the frozen part, "ops": [{"id", "action", "new"}], "signature"}``,
+            or None for a database without ``replay_base``.
+        """
+        point = c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "replay_base")).scalar()
+        if point is None:
+            return None
+        rev = self.revision(c)
+        if self._plan_cache is not None and self._plan_cache[0] == rev:
+            return copy.deepcopy(self._plan_cache[1])
+        events = list(c.execute(sa.select(events_t).where(events_t.c.undone.is_(False)).order_by(events_t.c.id)).mappings())
+        point = max([int(point)] + [int(ev["id"]) for ev in events if ev["action"] == "restore"])
+        name = c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "name")).scalar_one()
+        state = self._initial_state(c, name)
+        ops: list[dict] = []
+
+        def amend(action: str, new) -> None:
+            self._apply(state, {"action": action, "new": json.dumps(new), "old": None, "street": None, "id": 0})
+
+        def drop(pred) -> None:
+            ops[:] = [op for op in ops if not pred(op)]
+
+        for ev in events:
+            if int(ev["id"]) <= point:
+                self._apply(state, ev)
+                continue
+            act = ev["action"]
+            if act not in self._NETWORK_ACTIONS:
+                continue
+            new = json.loads(ev["new"]) if ev["new"] is not None else None
+            op = {"id": int(ev["id"]), "action": act, "new": new}
+            if act == "road_geometry" and new.get("coords") is None:
+                amend(act, new)
+                drop(lambda o, ref=new["ref"]: o["action"] == "road_geometry" and o["new"]["ref"] == ref)
+            elif act == "road_stretch":
+                gone = [ref for ref, coords in new["geometry"].items() if coords is None]
+                if gone or any(point_ is None for point_ in new["nodes"].values()):
+                    amend(act, {"geometry": {ref: None for ref in gone}, "nodes": {n: None for n, p in new["nodes"].items() if p is None}})
+                op["new"] = {**new, "geometry": {r: g for r, g in new["geometry"].items() if g is not None},
+                             "nodes": {n: p for n, p in new["nodes"].items() if p is not None}}
+                ops.append(op)
+            elif act == "edges_restore":
+                later = {"edges": set(), "features": set()}
+                for o in ops:
+                    if o["action"] == "edges_remove":
+                        for key in ("edges", "features"):
+                            mine = set(o["new"].get(key, [])) & set(new.get(key, []))
+                            later[key] |= mine
+                            o["new"] = {**o["new"], key: [x for x in o["new"].get(key, []) if x not in mine]}
+                amend(act, {key: [x for x in new.get(key, []) if x not in later[key]] for key in ("edges", "features")})
+            elif act == "road_operations_remove":
+                ids = set(new.get("ids", []))
+                drop(lambda o: o["action"] in ("road_cut", "road_join") and o["new"].get("id") in ids)
+                amend(act, new)
+            elif act == "roads_remove":
+                mine = any(o["action"] == "roads_import" and o["new"]["id"] == new["id"] for o in ops)
+                drop(lambda o: o["action"] == "roads_import" and o["new"]["id"] == new["id"])
+                if not mine:
+                    amend(act, new)
+            elif act == "roads_unname":
+                mine = False
+                for o in ops:
+                    if o["action"] == "roads_import" and o["new"]["id"] == new["id"]:
+                        o["new"] = {**o["new"], "features": [{**f, "name": None} for f in o["new"]["features"]]}
+                        mine = True
+                if not mine:
+                    amend(act, new)
+            elif act in ("road_connect", "road_connect_many", "road_unconnect"):
+                # A connection choice is keyed by the position of a drawn end: it applies to whichever drawn road has an end
+                # there, frozen or later (an import only uses the keys of its own ends).
+                amend(act, new)
+                for o in ops:
+                    if o["action"] == "roads_import":
+                        conn = dict(o["new"].get("connections") or {})
+                        if act == "road_connect":
+                            conn[new["node"]] = new["target"]
+                        elif act == "road_connect_many":
+                            conn.update(new["nodes"])
+                        else:
+                            conn.pop(new["node"], None)
+                        o["new"] = {**o["new"], "connections": conn}
+            else:
+                ops.append(op)
+        base_roads = Project.from_dict(self.root, state).roads
+        signature = hashlib.sha1(json.dumps({"point": point, "base": base_roads, "ops": ops}, sort_keys=True).encode()).hexdigest()[:16]
+        plan = {"point": point, "base_roads": base_roads, "ops": ops, "signature": signature}
+        self._plan_cache = (rev, plan)
+        return copy.deepcopy(plan)
+
+    def freeze_node_ids(self, ids: dict) -> None:
+        """Record once the ids the drawn-road nodes have now; from then on they never change (see ``roads.drawn_node_id``).
+
+        Kept outside the edit history, so that no undo or checkpoint restore takes it away.
+
+        Args:
+            ids: Node key -> node id.
+        """
+        with self.engine.begin() as c:
+            if c.execute(sa.select(meta_t.c.key).where(meta_t.c.key == "node_ids")).first() is None:
+                c.execute(meta_t.insert().values(key="node_ids", value=json.dumps({str(k): int(v) for k, v in ids.items()})))
 
     # ---- editing ----------------------------------------------------------------------------------------------------------
     def _add_event(self, c, action: str, street, old, new, user: str) -> int:
@@ -419,8 +641,11 @@ class Store:
             changes: Setting name -> value (unknown names are ignored).
             user: Author.
         """
-        valid = {k: v for k, v in changes.items() if k in Settings.__dataclass_fields__}
+        valid = {k: v for k, v in changes.items() if k in Settings.__dataclass_fields__ and k != "addressing_rule_version"}
         if valid:
+            # Persist the migration marker with the first settings edit. This makes later deliberate custom steps distinguishable
+            # from an old project that still carries the former 2 m / 20 m defaults.
+            valid["addressing_rule_version"] = ADDRESSING_RULE_VERSION
             with self.engine.begin() as c:
                 cur = self._state(c)["settings"]
                 self._add_event(c, "settings", None, {k: cur.get(k) for k in valid}, valid, user)
@@ -455,7 +680,8 @@ class Store:
             self._add_event(c, "unaccess", None, {"building": str(building_id), **old}, None, user)
         return True
 
-    def import_roads(self, file: str, features: list[dict], user: str = "", connections: dict | None = None, keep: list | None = None) -> int:
+    def import_roads(self, file: str, features: list[dict], user: str = "", connections: dict | None = None, keep: list | None = None,
+                     first_street_id: int | None = None) -> int:
         """Add a file of missing roads (drawn lines) to the project, with the connection choices made while previewing it.
 
         Args:
@@ -464,6 +690,8 @@ class Store:
             user: Author.
             connections: Connection choices by node key (see ``roads.integrate_roads``).
             keep: Existing edges that must stay although a new road replaces them.
+            first_street_id: Lowest free street id of the network now; the new roads (except those continuing a street) get
+                their ids from it, recorded in the edit.
 
         Returns:
             The id of the import.
@@ -471,6 +699,18 @@ class Store:
         with self.engine.begin() as c:
             imports = self._state(c)["roads"]["imports"]
             nid = max([i["id"] for i in imports] + [0]) + 1
+            if first_street_id is not None:
+                # Each new road keeps the street id it gets now, whatever is undone before it later; an id is never given twice.
+                kept = c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "next_street_id")).scalar()
+                sid = max(int(first_street_id), int(kept or 0))
+                features = [dict(f) for f in features]
+                for f in features:
+                    if f.get("join") is None and f.get("street_id") is None:
+                        f["street_id"], sid = sid, sid + 1
+                if kept is None:
+                    c.execute(meta_t.insert().values(key="next_street_id", value=str(sid)))
+                else:
+                    c.execute(meta_t.update().where(meta_t.c.key == "next_street_id").values(value=str(sid)))
             self._add_event(c, "roads_import", None, None, {"id": nid, "file": file, "features": features, "connections": connections or {}, "keep": keep or []}, user)
         return nid
 
@@ -505,6 +745,19 @@ class Store:
             with self.engine.begin() as c:
                 self._add_event(c, "point_rank", None, None, {"ranks": {str(k): int(v) for k, v in ranks.items()}}, user)
 
+    def set_house_quartiers(self, quartiers: dict, user: str = "") -> None:
+        """Correct the survey quartier of houses (one undo step); an empty value goes back to the survey's.
+
+        Args:
+            quartiers: ``{building id: quartier name}``.
+            user: Author.
+        """
+        if quartiers:
+            with self.engine.begin() as c:
+                old = self._state(c).get("roads", {}).get("quartier", {})
+                self._add_event(c, "house_quartier", None, {str(k): old.get(str(k)) for k in quartiers},
+                                {"quartier": {str(k): (str(v).strip() or None) if v else None for k, v in quartiers.items()}}, user)
+
     def set_street_attrs(self, attrs: dict, user: str = "") -> None:
         """Change the rank / drivable / paved flag of streets (one undo step).
 
@@ -512,11 +765,122 @@ class Store:
             attrs: ``{original street id: {"rank": 0-5, "drivable": bool, "paved": bool}}`` (only the keys that change).
             user: Author.
         """
-        attrs = {str(k): {kk: vv for kk, vv in v.items() if kk in ("rank", "drivable", "paved") and (vv is not None or kk != "rank")} for k, v in attrs.items()}
+        attrs = {str(k): {kk: vv for kk, vv in v.items() if kk in ("rank", "drivable", "paved", "addresses") and (vv is not None or kk not in ("rank", "addresses"))}
+                 for k, v in attrs.items()}
         attrs = {k: v for k, v in attrs.items() if v}
         if attrs:
             with self.engine.begin() as c:
                 self._add_event(c, "street_attrs", None, None, {"attrs": attrs}, user)
+
+    def register(self) -> dict:
+        """The address register: approved and retired addresses by building id.
+
+        Returns:
+            ``{building id: {"code", "address", "number", "street", "street_id", "status", "approved_at", "approved_by", "history", ...}}``.
+        """
+        with self.engine.connect() as c:
+            return self._state(c).get("register", {})
+
+    def approve_addresses(self, houses: dict, user: str = "", reason: str = "", correct: bool = False) -> dict:
+        """Validate the current address of houses, in one undoable event.
+
+        A validated address changes only through a validated correction (``correct``), which records the address before and after.
+        A house validated for the first time gets the next internal identifier (``FTN-000001-7``, with a check digit; not printed
+        on the plaque, which carries the address ``TCK 0575 0230``). The identifier is kept for ever: a correction changes the
+        address, never the identifier, and an identifier is never given twice, even when the validation is undone.
+
+        Args:
+            houses: ``{building id: snapshot}`` with at least ``address``, ``number``, ``street`` and ``street_id``.
+            user: Author.
+            reason: Why (required to correct an address that is already approved).
+            correct: True to replace an approved address (a correction); otherwise approved houses are left as they are.
+
+        Returns:
+            ``{"approved": [...], "corrected": [...], "unchanged": [...]}`` (building ids).
+
+        Raises:
+            ValueError: When a correction has no reason.
+        """
+        if correct and not reason.strip():
+            raise ValueError("say why the approved address is corrected")
+        out = {"approved": [], "corrected": [], "unchanged": []}
+        with self.engine.begin() as c:
+            reg = self._state(c).get("register", {})
+            kept = c.execute(sa.select(meta_t.c.value).where(meta_t.c.key == "next_address_code")).scalar()
+            nxt = int(kept or 1)
+            todo = {}
+            for bid, snap in houses.items():
+                bid = str(bid)
+                cur = reg.get(bid)
+                same = (cur.get("plate") == snap.get("plate") if cur and cur.get("plate") else cur and cur.get("address") == snap.get("address"))
+                if cur and cur.get("status") == "approved" and (not correct or (same and cur.get("address") == snap.get("address"))):
+                    out["unchanged"].append(bid)
+                    continue
+                snap = {k: snap.get(k) for k in ("address", "plate", "street_code", "number", "street", "street_id", "lat", "lon", "district",
+                                                 "quartier_code", "road_lat", "road_lon")}
+                if not (cur and cur.get("code")):
+                    snap["code"], nxt = address_code(nxt), nxt + 1
+                todo[bid] = snap
+                out["corrected" if cur and cur.get("status") == "approved" else "approved"].append(bid)
+            if todo:
+                if kept is None:
+                    c.execute(meta_t.insert().values(key="next_address_code", value=str(nxt)))
+                else:
+                    c.execute(meta_t.update().where(meta_t.c.key == "next_address_code").values(value=str(nxt)))
+                self._add_event(c, "address_approve", None, {b: reg.get(b) for b in todo}, {"houses": todo, "reason": reason or None}, user)
+        return out
+
+    def retire_addresses(self, ids: list, reason: str, user: str = "") -> list:
+        """Retire approved addresses (a demolished house), in one undoable event. The code is never given again.
+
+        Args:
+            ids: Building ids.
+            reason: Why (required).
+            user: Author.
+
+        Returns:
+            The building ids retired.
+
+        Raises:
+            ValueError: Without a reason.
+        """
+        if not reason.strip():
+            raise ValueError("say why the address is retired")
+        with self.engine.begin() as c:
+            reg = self._state(c).get("register", {})
+            ids = sorted({str(i) for i in ids if reg.get(str(i), {}).get("status") == "approved"})
+            if ids:
+                self._add_event(c, "address_retire", None, None, {"ids": ids, "reason": reason}, user)
+        return ids
+
+    def set_check_ok(self, ids: list, ok: bool = True, user: str = "") -> None:
+        """Mark road check problems "OK as is" (or list them again) in one undoable event (see ``road_check``).
+
+        Args:
+            ids: Problem ids.
+            ok: True to mark them, False to list them again.
+            user: Author.
+        """
+        ids = sorted({str(i) for i in ids})
+        if ids:
+            with self.engine.begin() as c:
+                self._add_event(c, "road_check_ok", None, None, {"ids": ids, "ok": bool(ok)}, user)
+
+    def set_edge_access(self, edges: dict, expected_revision: int | None = None, user: str = "") -> None:
+        """Mark stable edge references drivable ("car"), not drivable ("foot") or unknown in one undoable event.
+
+        Older projects may hold "moto"; it reads as not drivable but is no longer written.
+        """
+        allowed = {"car", "foot", None}
+        values = {str(ref): value for ref, value in edges.items()}
+        if any(value not in allowed for value in values.values()):
+            raise ValueError("access must be car, foot or null")
+        if not values:
+            return
+        with self.engine.begin() as c:
+            if expected_revision is not None and self.revision(c) != expected_revision:
+                raise Conflict("project changed; select the route again")
+            self._add_event(c, "edge_access", None, None, {"edges": values}, user)
 
     def assign_edge_streets(self, mapping: dict, user: str = "", names: dict | None = None, no_cut: list | None = None, attrs: dict | None = None) -> None:
         """Give roads another street id (one undo step), optionally with the name the street takes.
@@ -532,13 +896,51 @@ class Store:
                                                                   "names": {str(k): v for k, v in (names or {}).items()}, "no_cut": [int(x) for x in (no_cut or [])], "attrs": {str(k): v for k, v in (attrs or {}).items()}}, user)
                 self._after(c)
 
-    def set_road_geometry(self, ref: str, coords: list, expected_revision: int, user: str = "") -> None:
+    def set_road_geometry(self, ref: str, coords: list, expected_revision: int, user: str = "", uncertain_end: dict | None = None) -> None:
         """Reshape one edge, retaining its identity; one undoable event."""
         with self.engine.begin() as c:
             if self.revision(c) != expected_revision:
                 raise Conflict("project changed; reload the road before saving")
-            old = self._state(c).get("roads", {}).get("geometry", {}).get(ref)
-            self._add_event(c, "road_geometry", None, {"ref": ref, "coords": old}, {"ref": ref, "coords": coords}, user)
+            roads = self._state(c).get("roads", {})
+            old = roads.get("geometry", {}).get(ref)
+            old_review = roads.get("geometry_reviews", {}).get(ref)
+            self._add_event(c, "road_geometry", None, {"ref": ref, "coords": old, "uncertain_end": old_review},
+                            {"ref": ref, "coords": coords, "uncertain_end": uncertain_end}, user)
+
+    def set_road_stretch(self, geometry: dict, nodes: dict, expected_revision: int, user: str = "", reviews: dict | None = None) -> None:
+        """Reshape several consecutive sections of one road and move the nodes between them; one undoable event.
+
+        Args:
+            geometry: Edge reference -> WGS84 coordinates.
+            nodes: Node id -> ``[lon, lat]``.
+            expected_revision: Refused when the project changed meanwhile.
+            user: Author.
+            reviews: Edge reference -> "unclear beyond B" mark (or None to clear it).
+        """
+        with self.engine.begin() as c:
+            if self.revision(c) != expected_revision:
+                raise Conflict("project changed; reload the road before saving")
+            roads = self._state(c).get("roads", {})
+            nodes = {str(n): p for n, p in nodes.items()}
+            reviews = reviews or {}
+            old = {"geometry": {ref: roads.get("geometry", {}).get(ref) for ref in geometry},
+                   "nodes": {n: roads.get("node_moves", {}).get(n) for n in nodes},
+                   "reviews": {ref: roads.get("geometry_reviews", {}).get(ref) for ref in reviews}}
+            self._add_event(c, "road_stretch", None, old, {"geometry": geometry, "nodes": nodes, "reviews": reviews}, user)
+
+    def add_road_review(self, review: dict, expected_revision: int, user: str = "") -> None:
+        """Mark one interval of a road as unclear without changing its geometry."""
+        with self.engine.begin() as c:
+            if self.revision(c) != expected_revision:
+                raise Conflict("project changed; select the unclear portion again")
+            self._add_event(c, "road_review", None, None, review, user)
+
+    def remove_road_reviews(self, ids: list[str], expected_revision: int, user: str = "") -> None:
+        """Resolve selected unclear-road review marks as one undoable event."""
+        with self.engine.begin() as c:
+            if self.revision(c) != expected_revision:
+                raise Conflict("project changed; reload the unclear portions")
+            self._add_event(c, "road_review_remove", None, None, {"ids": [str(value) for value in ids]}, user)
 
     def remove_edges(self, edges: list[str], features: list[str], user: str = "") -> None:
         """Delete street edges (base network edges by reference, drawn lines by key); undoable.
@@ -557,6 +959,23 @@ class Store:
 
     def add_road_join(self, join: dict, expected_revision: int, user: str = "") -> None:
         self._road_operation('road_join', join, expected_revision, user)
+
+    def remove_road_operations(self, ids: list[str], reason: str, expected_revision: int, user: str = "") -> None:
+        """Remove invalid saved cuts/joins as one attributed, undoable maintenance edit."""
+        ids = sorted({str(value) for value in ids if value})
+        if not ids:
+            return
+        if not isinstance(reason, str) or not 5 <= len(reason.strip()) <= 500:
+            raise ValueError('explain why the road operations are removed')
+        with self.engine.begin() as c:
+            if self.revision(c) != expected_revision:
+                raise Conflict('project changed; reload the road warnings')
+            current = self._state(c).get('roads', {})
+            existing = {operation.get('id') for key in ('cuts', 'joins') for operation in current.get(key, [])}
+            if not set(ids) <= existing:
+                raise ValueError('one or more road operations no longer exist')
+            self._add_event(c, 'road_operations_remove', None, None,
+                            {'ids': ids, 'reason': reason.strip()}, user)
 
     def _road_operation(self, action: str, operation: dict, expected_revision: int, user: str) -> None:
         with self.engine.begin() as c:

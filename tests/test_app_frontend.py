@@ -158,6 +158,8 @@ def test_edit_streets_tab_preview_accept_and_delete_in_a_browser(live_app, tmp_p
         page.wait_for_function("!document.body.classList.contains('locked')")
         page.wait_for_selector("#tabs button[data-tab=roads]:not([disabled])")
         page.click("#tabs button[data-tab=roads]")
+        wait_for(page, "S.roads && S.baseStreets && S.components && document.querySelector('#roads-file')")   # the panel is drawn again until its data is in
+        page.wait_for_timeout(500)
         page.set_input_files("#roads-file", str(kml))
         wait_for(page, "S.stage && S.stage.pv")
         sm = page.evaluate("S.stage.pv.summary")
@@ -171,6 +173,8 @@ def test_edit_streets_tab_preview_accept_and_delete_in_a_browser(live_app, tmp_p
         page.wait_for_function("S.stage.pv.summary.connected >= 2 || S.stage.pv.summary.not_connected >= 1")
         page.click("#panel button[data-act=stage-cancel]")                                               # cancel: nothing happens
         assert page.evaluate("S.stage") is None and page.evaluate("S.project.roads.imports.length") == 0
+        wait_for(page, "document.querySelector('#roads-file')")
+        page.wait_for_timeout(1500)                                                                       # the panel is drawn again after cancelling
         page.set_input_files("#roads-file", str(kml))
         wait_for(page, "S.stage && S.stage.pv")
         page.click("#panel button[data-act=stage-accept]")                                               # asks for confirmation (accepted)
@@ -300,14 +304,16 @@ def test_all_building_points_are_shown_on_the_addresses_tab_before_computing(liv
         wait_for(page, "S.rawBuildings && G.houses.getLayers().length > 0")
         total = page.evaluate("S.rawBuildings.features.length")
         assert total > 30 and page.evaluate("G.houses.getLayers().flatMap(g => g.getLayers()).filter(l => l.options.radius).length") == total       # the buildings (the reference points are emoji markers)
+        tooltip = page.evaluate("""() => { const f = S.rawBuildings.features[0], c = f.geometry.coordinates; return buildingTooltip(f, {lat:c[1],lng:c[0]}); }""")
+        assert "Coordinates" in tooltip and "Internal record ID" in tooltip and "Legacy record" in tooltip
         assert "buildings are shown" in page.inner_text("#panel")
     finally:
         browser.close()
         pw.stop()
 
 
-def test_everything_recomputes_by_itself_and_there_are_no_compute_buttons(live_app):
-    """Street ids follow every edit (also of another editor); the addresses are computed when the Addresses tab opens."""
+def test_switching_workspaces_never_recomputes_and_explicit_buttons_apply_edits(live_app):
+    """Workspace navigation is cheap; the editor explicitly applies pending ids and addresses."""
     import json
     import urllib.request
 
@@ -328,19 +334,33 @@ def test_everything_recomputes_by_itself_and_there_are_no_compute_buttons(live_a
         page.goto(url)
         page.wait_for_selector("#ref-confirm")
         page.click("#ref-confirm")
-        wait_for(page, "S.network && S.network.streets")                                    # computed without any button
-        assert page.locator("[data-act=compute], [data-act=compute-addresses]").count() == 0
+        wait_for(page, "S.network && S.network.streets")                                    # initial project setup is computed once
         for tab in ("names", "addresses", "ids"):
             page.click(f"#tabs button[data-tab={tab}]")
-            assert page.locator("[data-act=compute], [data-act=compute-addresses]").count() == 0
+            assert page.evaluate("S.polling") is False
         page.click("#tabs button[data-tab=addresses]")
-        wait_for(page, "S.addresses && S.addresses.houses")                                 # computed when the tab was opened
+        page.wait_for_selector("[data-act=compute-addresses]")                               # opening the tab does not compute
+        assert page.evaluate("S.addresses") is None
+        page.click("[data-act=compute-addresses]")
+        wait_for(page, "S.addresses && S.addresses.houses")
         sid = page.evaluate("S.network.plan[0].street_id_original")
         post("/names", {"street_id": sid, "name": "Rue Auto"})                              # another editor names a street
         page.wait_for_selector("#recompute-now", state="visible", timeout=60000)                        # edits wait: the bar offers the recomputation
+        for tab in ("roads", "names", "addresses", "ids"):
+            page.click(f"#tabs button[data-tab={tab}]")
+            assert page.evaluate("S.polling") is False                                      # tab switches never apply it
+        wait_for(page, "G.base.getLayers().length > 0")
+        assert page.evaluate("G.net.getLayers().length") == 0                               # no obsolete computed roads
+        assert "current road geometry is shown in orange" in page.locator("#panel").inner_text().lower()
         page.click("#recompute-now")
+        page.wait_for_selector("#compute-status", state="visible")
+        assert "current map stays visible" in page.locator("#compute-status").inner_text().lower()
         wait_for(page, "S.network.streets.features.some(f => f.properties.name === 'Rue Auto')", seconds=120)
-        wait_for(page, "S.addresses && S.addresses.houses && !S.project.addresses_stale", seconds=120)       # the addresses follow on the open tab
+        wait_for(page, "!S.polling && document.querySelector('#compute-status').hidden", seconds=30)
+        page.click("#tabs button[data-tab=addresses]")
+        page.wait_for_selector("[data-act=compute-addresses]")
+        page.click("[data-act=compute-addresses]")
+        wait_for(page, "S.addresses && S.addresses.houses && !S.project.addresses_stale", seconds=120)
     finally:
         browser.close()
         pw.stop()
@@ -475,6 +495,7 @@ def test_colour_by_rank_drivable_paved_and_attribute_editing_in_the_popup(live_a
         page.wait_for_selector("#ref-confirm")
         page.click("#ref-confirm")
         wait_for(page, "S.network && !S.project.stale")
+        page.wait_for_selector("#color-mode")
         assert page.locator("#color-mode option").count() == 5
         for mode in ("rank", "drivable", "paved"):
             page.select_option("#color-mode", mode)
@@ -514,6 +535,7 @@ def test_reference_point_sign_ranks_are_editable_on_the_addresses_tab(live_app):
         page.click("#ref-confirm")
         wait_for(page, "S.network && !S.project.stale")
         page.click("#tabs button[data-tab=addresses]")
+        page.click("[data-act=compute-addresses]")                                     # opening the tab does not compute
         wait_for(page, "S.addresses && S.pointRanks && S.pointRanks.length > 0")
         page.click("details.sec summary")
         page.select_option("select.pt-rank >> nth=0", "1")
@@ -545,10 +567,12 @@ def test_a_click_on_an_empty_place_clears_the_selection_and_the_special_styles(l
         page.click("#ref-confirm")
         wait_for(page, "S.network && !S.project.stale")
         page.click("#tabs button[data-tab=addresses]")
+        page.click("[data-act=compute-addresses]")                                     # opening the tab does not compute
         wait_for(page, "S.addresses && S.addresses.houses")
-        page.evaluate("(() => { const f = S.addresses.houses.features.find(f => f.properties.road_lat); S.sel = { type: 'house', props: f.properties, ll: L.latLng(f.geometry.coordinates[1], f.geometry.coordinates[0]) }; drawAccess(f.properties); refreshSel(); })()")
+        page.evaluate("(() => { const f = S.addresses.houses.features.find(f => f.properties.road_lat); S.sel = { type: 'house', props: f.properties, ll: L.latLng(f.geometry.coordinates[1], f.geometry.coordinates[0]) }; refreshSel(); })()")
         page.wait_for_selector(".sel-popup")
-        assert page.evaluate("G.access.getLayers().length") > 0
+        page.evaluate("drawAccess(S.sel.props)")
+        wait_for(page, "G.access.getLayers().length > 0")
         page.evaluate("map.setView([5.0, 9.0], 12, { animate: false }); 0")                       # somewhere with nothing on it
         page.mouse.click(300, 400)
         wait_for(page, "!S.sel && G.access.getLayers().length === 0 && !document.querySelector('.sel-popup')")
@@ -611,7 +635,7 @@ def test_simple_page_redirects_to_the_full_app_when_the_network_has_connection_p
     try:
         page = browser.new_page(viewport={"width": 1200, "height": 800})
         page.goto(url + "/simple/")
-        wait_for(page, "!location.pathname.includes('simple')", 120)
+        page.wait_for_url(lambda current: "/simple/" not in current, timeout=120_000)
         assert page.url.rstrip("/") == url
     finally:
         browser.close()

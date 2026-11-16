@@ -47,7 +47,9 @@ from . import engine, exports, roads as roads_mod
 from .project import Project
 from .store import Conflict, Store
 from . import street_ops
-from . import work_areas
+from . import households as households_mod
+from . import plate as plate_mod
+from . import plaque, road_check, work_areas
 from .identity import actor_id
 
 def me() -> str:
@@ -93,7 +95,9 @@ class Context:
         self.addresses_hash: str | None = None
         self.effective: tuple | None = None
         self.effective_hash: str | None = None
+        self.effective_cache: dict[str, tuple] = {}
         self.lock = threading.Lock()
+        self.effective_lock = threading.Lock()              # several map requests may need the same expensive replay at once
         self.job = {"state": "idle", "kind": None, "step": "", "error": None}
 
     def get_base(self) -> engine.BaseData:
@@ -115,12 +119,44 @@ class Context:
         Returns:
             ``(base, roads_result)`` from :func:`engine.effective_base`.
         """
-        proj = proj or self.store.project()
-        h = proj.roads_hash()
-        if self.effective is None or self.effective_hash != h:
-            self.effective = engine.effective_base(self.get_base(), proj)
+        # /roads, /base/streets, /base/components and the compute worker can arrive together after one edit.  Without
+        # this lock they all replay every historical geometry operation in parallel, turning a 10-20 s update into
+        # several minutes and racing to replace the cache with the same result.
+        with self.effective_lock:
+            proj = proj or self.store.project()
+            if proj.node_ids is None:
+                # First opening since the drawn-road node ids became stable: record the ids they have now, which the saved
+                # edits use, and continue with them.
+                _base, res = engine.effective_base(self.get_base(), proj, write_cache=False)
+                self.store.freeze_node_ids(res.report.get("node_ids", {}) if res is not None else {})
+                proj.node_ids = self.store.project().node_ids
+            h = proj.roads_hash()
+            cached = self.effective_cache.get(h)
+            if cached is None:
+                cached = engine.effective_base(self.get_base(), proj)
+                self.effective_cache[h] = cached
+                # A compute worker may still hold the preceding project snapshot while the browser asks for the latest
+                # one.  Retaining those two revisions prevents them from repeatedly evicting and rebuilding each other.
+                while len(self.effective_cache) > 2:
+                    self.effective_cache.pop(next(iter(self.effective_cache)))
+            self.effective = cached
             self.effective_hash = h
-        return self.effective
+            return self.effective
+
+    @staticmethod
+    def roads_report(proj: Project, result) -> dict:
+        """Combine integration warnings with manual uncertainty marks on reshaped roads."""
+        report = dict(result.report) if result is not None else {}
+        uncertain = list(report.get("uncertain_ends", []))
+        for ref, point in proj.roads.get("geometry_reviews", {}).items():
+            uncertain.append({"key": f"geometry:{ref}", "ref": ref, "lon": float(point["lon"]),
+                              "lat": float(point["lat"]), "source": "geometry_review"})
+        if uncertain:
+            report["uncertain_ends"] = uncertain
+        sections = list(proj.roads.get("reviews", []))
+        if sections:
+            report["uncertain_sections"] = sections
+        return report
 
     def run_job(self, kind: str, actor: str = 'system:startup') -> bool:
         """Start a background computation unless one is running.
@@ -148,7 +184,7 @@ class Context:
         try:
             proj = self.store.project()
             base, rres = self.get_effective(proj)
-            report = rres.report if rres else None
+            report = self.roads_report(proj, rres)
             if kind == "network":
                 state = engine.compute_network(base, proj, progress=lambda s: self.job.update(step=s), roads_report=report,
                                                hint_extra=getattr(self.network, "extra", None), branch_ids=self.store.get_computed("branch_ids"))
@@ -540,17 +576,23 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         """The drawn (missing) roads as they are connected now: lines, nodes with their state and suggestions."""
         p = ctx.store.project()
         base, res = ctx.get_effective(p)
+        report = ctx.roads_report(p, res)
         if res is None:
+            reviews = [{"type": "Feature", "properties": {k: v for k, v in review.items() if k != "geometry"}, "geometry": review["geometry"]}
+                       for review in p.roads.get("reviews", [])]
             return {"imports": [{"id": i["id"], "file": i["file"], "lines": len(i["features"])} for i in p.roads["imports"]], "edges": {"type": "FeatureCollection", "features": []}, "nodes": {"type": "FeatureCollection", "features": []},
-                    "report": {}}
+                    "reviews": {"type": "FeatureCollection", "features": reviews}, "report": report}
         feats = [{"type": "Feature", "properties": {"street_id": int(r["street_id"]), "feature": r["feature"], "name": r["name"],
                                                      "u_state": r["u_state"], "v_state": r["v_state"]},
                   "geometry": shapely.geometry.mapping(shapely.set_precision(r.geometry, 1e-6))} for _, r in res.new_edges.iterrows()]
         nodes = [{"type": "Feature", "properties": {k: v for k, v in n.items() if k not in ("lat", "lon")},
                   "geometry": {"type": "Point", "coordinates": [n["lon"], n["lat"]]}} for n in res.report["nodes"]]
-        rep = {k: v for k, v in res.report.items() if k != "nodes"}
+        rep = {k: v for k, v in report.items() if k != "nodes"}
+        reviews = [{"type": "Feature", "properties": {k: v for k, v in review.items() if k != "geometry"}, "geometry": review["geometry"]}
+                   for review in p.roads.get("reviews", [])]
         return {"imports": [{"id": i["id"], "file": i["file"], "lines": len(i["features"])} for i in p.roads["imports"]],
-                "edges": {"type": "FeatureCollection", "features": feats}, "nodes": {"type": "FeatureCollection", "features": nodes}, "report": rep}
+                "edges": {"type": "FeatureCollection", "features": feats}, "nodes": {"type": "FeatureCollection", "features": nodes},
+                "reviews": {"type": "FeatureCollection", "features": reviews}, "report": rep}
 
     def read_features(body: dict) -> tuple[str, list[dict]]:
         """The drawn lines of a request: the uploaded file, or the lines the browser already holds.
@@ -573,6 +615,16 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
                 raise HTTPException(400, f"cannot read the roads from {name}: {exc}")
         return name, roads_mod.features_from_lines(gdf)
 
+    def free_street_id() -> int:
+        """The lowest street id above every id of the current network (and of the community edge edits)."""
+        base, _res = ctx.get_effective()
+        top = [int(pd.to_numeric(base.streets["street_id"]).max())]
+        if base.edge_edits:
+            ee = pd.read_csv(base.edge_edits, dtype=str)
+            if "new_street_id" in ee and len(ee):
+                top.append(int(pd.to_numeric(ee["new_street_id"], errors="coerce").max() or 0))
+        return max(top) + 1
+
     @app.post("/api/roads/preview")
     def post_roads_preview(body: dict = Body(...)) -> dict:
         """Show how an uploaded roads file would be merged, without changing the project.
@@ -587,6 +639,10 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         name, feats = read_features(body)
         p = ctx.store.project()
         staged = {"id": "p", "file": name, "features": feats}
+        if p.replay is not None:                       # applied after the edits so far, as it will be once saved
+            p.replay = {**p.replay, "ops": [*p.replay["ops"], {"id": 0, "action": "roads_import",
+                                                                "new": {**staged, "connections": body.get("connections") or {}, "keep": body.get("keep") or []}}],
+                        "signature": None}
         p.roads = {**p.roads, "imports": [*p.roads["imports"], staged], "connections": {**p.roads["connections"], **(body.get("connections") or {})},
                    "keep": sorted(set(p.roads.get("keep", [])) | set(body.get("keep") or []))}
         _base, res = engine.effective_base(ctx.get_base(), p, write_cache=False)
@@ -613,7 +669,7 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
     def post_roads_import(body: dict = Body(...)) -> dict:
         """Add the previewed roads to the project: ``{"filename", "features" | "content_b64", "connections", "keep"}``."""
         name, feats = read_features(body)
-        iid = ctx.store.import_roads(name, feats, me(), body.get("connections") or {}, body.get("keep") or [])
+        iid = ctx.store.import_roads(name, feats, me(), body.get("connections") or {}, body.get("keep") or [], first_street_id=free_street_id())
         return {"id": iid, "lines": len(feats), "status": ctx.store.status(me())}
 
     @app.post("/api/roads/snap")
@@ -677,8 +733,13 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
                 if k in body:
                     f[k] = None if body[k] is None else bool(body[k])           # null = unknown
             feats.append(f)
-        iid = ctx.store.import_roads("drawn by hand", feats, me(), {}, [])
-        return {"id": iid, "status": ctx.store.status(me())}
+        iid = ctx.store.import_roads("drawn by hand", feats, me(), {}, [], first_street_id=free_street_id())
+        # Return the saved trace itself.  The browser can display it immediately while the effective graph and street ids
+        # are rebuilt in the background; seeing a saved line must never depend on a full recomputation.
+        edges = [{"type": "Feature", "properties": {"feature": f"{iid}:{f['id']}", "name": f.get("name"),
+                                                        "street_id": f.get("join")},
+                  "geometry": {"type": "LineString", "coordinates": f["coords"]}} for f in feats]
+        return {"id": iid, "status": ctx.store.status(me()), "edges": {"type": "FeatureCollection", "features": edges}}
 
     @app.get("/api/edges")
     def get_edges() -> dict:
@@ -779,6 +840,244 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
             raise HTTPException(409, "project changed; reload the road before saving")
         return {"status": ctx.store.status(me())}
 
+    def partial_geometry_selection(body: dict):
+        """Resolve two clicks to ordered points on one current road section."""
+        try:
+            ref = str(body["ref"])
+            points = [[float(x), float(y)] for x, y in body["points"]]
+            if len(points) != 2 or any(not math.isfinite(x) or not math.isfinite(y) or abs(x) > 180 or abs(y) > 90 for x, y in points):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "choose two valid anchor points on the same road section")
+        base, _ = ctx.get_effective()
+        idx = next((idx for idx in base.edges.index if idx[0] < idx[1] and idx[2] < roads_mod.SYNTHETIC_KEY
+                    and roads_mod.edge_ref(*idx) == ref), None)
+        if idx is None:
+            raise HTTPException(404, "road section changed; select it again")
+        geom = base.edges.loc[idx].geometry
+        transform = Transformer.from_crs(4326, base.crs, always_xy=True)
+        clicks = [shapely.geometry.Point(*transform.transform(*point)) for point in points]
+        # B may be on a following section of the same road: the section nearest to it (the selected one when about as near).
+        clicks.sort(key=geom.distance)
+        far = clicks[1]
+        if far.distance(geom) > 2:
+            real = [(i, g) for i, g in zip(base.edges.index, base.edges.geometry) if i[0] < i[1] and i[2] < roads_mod.SYNTHETIC_KEY]
+            near_idx, near_geom = min(real, key=lambda pair: pair[1].distance(far))
+            if near_idx != idx and near_geom.distance(far) + 1 < far.distance(geom):
+                if far.distance(near_geom) > 25 or clicks[0].distance(geom) > 25:
+                    raise HTTPException(400, "choose anchor points closer to the road")
+                stretch = stretch_selection(ref, base, idx, geom, clicks[0], near_idx, near_geom, far)
+                if stretch is not None:
+                    return stretch
+                # An intentionally off-line anchor can be nearer to an unrelated road.  In that case the
+                # unrelated road must not hijack the selection: keep resolving both anchors against the road
+                # the user selected below.
+        if any(point.distance(geom) > 25 for point in clicks):
+            raise HTTPException(400, "choose anchor points closer to the selected road")
+        clicks.sort(key=geom.project)
+        start_m, end_m = (geom.project(point) for point in clicks)
+        if end_m - start_m < 2:
+            raise HTTPException(400, "choose anchor points at least 2 metres apart")
+        from shapely.ops import substring
+        selected = substring(geom, start_m, end_m)
+        # An anchor clicked more than 2 m off the old line stays exactly where it was clicked. Inside the section the new trace
+        # rejoins the old line straight from there; at an end of the section that node (junction or dead end) moves to it.
+        anchors = [click if click.distance(geom) > 2 else geom.interpolate(m) for click, m in zip(clicks, (start_m, end_m))]
+        wgs = gpd.GeoSeries([*anchors, selected], crs=base.crs).to_crs(4326)
+        return ref, geom, start_m, end_m, anchors, wgs, base, idx
+
+    def stretch_selection(ref, base, idx_a, geom_a, click_a, idx_b, geom_b, click_b):
+        """Resolve A and B across connected sections, or return ``None`` when the nearer section is unrelated."""
+        import networkx as nx
+        from shapely.ops import substring
+        street_a = base.edges.loc[idx_a, "street_id"]
+        street_b = base.edges.loc[idx_b, "street_id"]
+        if pd.isna(street_a) or pd.isna(street_b) or int(street_a) != int(street_b):
+            return None
+        graph = nx.Graph()
+        for i, g in zip(base.edges.index, base.edges.geometry):
+            same_street = not pd.isna(base.edges.loc[i, "street_id"]) and int(base.edges.loc[i, "street_id"]) == int(street_a)
+            if i[0] < i[1] and i[2] < roads_mod.SYNTHETIC_KEY and i not in (idx_a, idx_b) and same_street:
+                if not graph.has_edge(i[0], i[1]) or graph[i[0]][i[1]]["w"] > g.length:
+                    graph.add_edge(i[0], i[1], w=g.length, idx=i)
+        ma, mb = geom_a.project(click_a), geom_b.project(click_b)
+        best = None
+        for na, la in ((idx_a[0], ma), (idx_a[1], geom_a.length - ma)):
+            for nb, lb in ((idx_b[0], mb), (idx_b[1], geom_b.length - mb)):
+                if na == nb:
+                    lp, path = 0.0, [na]
+                else:
+                    try:
+                        lp, path = nx.single_source_dijkstra(graph, na, nb, weight="w")
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        continue
+                if best is None or la + lp + lb < best[0]:
+                    best = (la + lp + lb, na, nb, path)
+        if best is None or best[0] > 3000 or len(best[3]) > 40:
+            return None
+        _, na, nb, path = best
+
+        def coords(line):
+            return list(line.coords)
+        part_a = coords(substring(geom_a, ma, geom_a.length)) if na == idx_a[1] else coords(substring(geom_a, 0, ma))[::-1]
+        part_b = coords(substring(geom_b, 0, mb)) if nb == idx_b[0] else coords(substring(geom_b, mb, geom_b.length))[::-1]   # node nb to B
+        middle = []
+        for p, q in zip(path, path[1:]):
+            i = graph[p][q]["idx"]
+            c = coords(base.edges.loc[i].geometry)
+            middle.append((i, c if i[0] == p else c[::-1]))
+        old = part_a + [pt for _, c in middle for pt in c[1:]] + part_b[1:]
+        old_line = shapely.geometry.LineString(dedupe(old))
+        def anchor(click, g, m):                                       # more than 2 m off the old line: where it was clicked
+            return click if click.distance(g) > 2 else g.interpolate(m)
+        anchors = [anchor(click_a, geom_a, ma), anchor(click_b, geom_b, mb)]
+        wgs = gpd.GeoSeries([*anchors, old_line], crs=base.crs).to_crs(4326)
+        stretch = {"idx_a": idx_a, "idx_b": idx_b, "ma": ma, "mb": mb, "na": na, "nb": nb, "path": path, "middle": middle,
+                   "part_a": part_a, "part_b": part_b, "old": old_line}
+        return ref, geom_a, 0.0, old_line.length, anchors, wgs, base, stretch
+
+    def dedupe(points):
+        out = []
+        for p in points:
+            if not out or shapely.geometry.Point(p).distance(shapely.geometry.Point(out[-1])) > 1e-6:
+                out.append(tuple(p))
+        return out
+
+    def save_stretch(stretch, anchors, coords, base, revision, end_review):
+        """Cut the new trace at the nodes between the sections, move those nodes onto it and reshape every section."""
+        from shapely.ops import substring
+        trace = shapely.geometry.LineString(dedupe(coords))
+        length = trace.length
+        old, path = stretch["old"], stretch["path"]
+        old_d = [old.project(shapely.geometry.Point(base.nodes.geometry.loc[n].coords[0])) for n in path]
+        at = [trace.project(base.nodes.geometry.loc[n]) for n in path]
+        if any(b - a < .5 for a, b in zip([0.0] + at, at + [length])):
+            at = [d / old.length * length for d in old_d]               # a winding trace: share it out in proportion
+        def run(points):
+            return sum(math.dist(p, q) for p, q in zip(points, points[1:]))
+        if run(stretch["part_a"]) < .5:
+            at[0] = 0.0                                                # A was on the node itself
+        if run(stretch["part_b"]) < .5:
+            at[-1] = length
+        def seg(a, b):
+            return list(substring(trace, a, b).coords) if b - a > 1e-6 else [tuple(trace.interpolate(a).coords[0])]
+        geom_a, geom_b = base.edges.loc[stretch["idx_a"]].geometry, base.edges.loc[stretch["idx_b"]].geometry
+        ia, ib, ma, mb = stretch["idx_a"], stretch["idx_b"], stretch["ma"], stretch["mb"]
+        shapes, ends_moved = {}, {}
+        # An off-line anchor at the far end of its section takes that end's node along (instead of a link back to it).
+        far_a, a_far = (ia[0], ma < .5) if stretch["na"] == ia[1] else (ia[1], ma > geom_a.length - .5)
+        if a_far and anchors[0].distance(geom_a.interpolate(ma)) > .01:
+            ends_moved[far_a] = anchors[0]
+        far_b, b_far = (ib[1], mb > geom_b.length - .5) if stretch["nb"] == ib[0] else (ib[0], mb < .5)
+        if b_far and anchors[1].distance(geom_b.interpolate(mb)) > .01:
+            ends_moved[far_b] = anchors[1]
+        keep_a = [] if far_a in ends_moved else None
+        keep_b = [] if far_b in ends_moved else None
+        if stretch["na"] == ia[1]:
+            shapes[ia] = (list(substring(geom_a, 0, ma).coords) if keep_a is None else keep_a) + seg(0, at[0])
+        else:
+            shapes[ia] = seg(0, at[0])[::-1] + (list(substring(geom_a, ma, geom_a.length).coords) if keep_a is None else keep_a)
+        for j, (i, _c) in enumerate(stretch["middle"]):              # section j runs from path[j] to path[j + 1]
+            piece = seg(at[j], at[j + 1])
+            shapes[i] = piece if i[0] == path[j] else piece[::-1]
+        if stretch["nb"] == ib[0]:
+            shapes[ib] = seg(at[-1], length) + (list(substring(geom_b, mb, geom_b.length).coords) if keep_b is None else keep_b)
+        else:
+            shapes[ib] = (list(substring(geom_b, 0, mb).coords) if keep_b is None else keep_b) + seg(at[-1], length)[::-1]
+        to_wgs = Transformer.from_crs(base.crs, 4326, always_xy=True)
+        geometry = {}
+        for i, pts in shapes.items():
+            pts = dedupe(pts)
+            line = shapely.geometry.LineString(pts) if len(pts) > 1 else None
+            if line is None or line.length < .3 or not line.is_simple:
+                raise HTTPException(400, "the corrected road must not cross itself; trace it again")
+            geometry[roads_mod.edge_ref(*i)] = [list(to_wgs.transform(x, y)) for x, y in pts]
+        nodes = {}
+        for n, a in zip(path, at):
+            p = trace.interpolate(a)
+            nodes[int(n)] = list(to_wgs.transform(p.x, p.y))
+        for n, p in ends_moved.items():
+            nodes[int(n)] = list(to_wgs.transform(p.x, p.y))
+        reviews = None
+        if end_review:
+            lon, lat = to_wgs.transform(anchors[1].x, anchors[1].y)
+            reviews = {roads_mod.edge_ref(*ib): {"lon": lon, "lat": lat, "note": "path beyond B is unclear"}}
+        try:
+            ctx.store.set_road_stretch(geometry, nodes, revision, me(), reviews=reviews)
+        except Conflict:
+            raise HTTPException(409, "project changed; select the road portion again")
+        return {"status": ctx.store.status(me()), "replaced_m": round(old.length, 2), "uncertain": bool(end_review), "sections": len(geometry)}
+
+    @app.post("/api/roads/geometry/partial/preview")
+    def post_partial_geometry_preview(body: dict = Body(...)) -> dict:
+        """Preview the exact portion that will be replaced between two anchors."""
+        _, _, start_m, end_m, _, wgs, _, _ = partial_geometry_selection(body)
+        return {"type": "Feature", "properties": {
+            "selected_m": round(end_m - start_m, 2),
+            "anchors": [[wgs.iloc[0].x, wgs.iloc[0].y], [wgs.iloc[1].x, wgs.iloc[1].y]],
+        }, "geometry": shapely.geometry.mapping(wgs.iloc[2])}
+
+    @app.post("/api/roads/geometry/partial")
+    def post_partial_geometry(body: dict = Body(...)) -> dict:
+        """Replace only the road geometry between two fixed interior anchors."""
+        try:
+            revision = int(body["revision"])
+            replacement_coords = [[float(x), float(y)] for x, y in body["coords"]]
+            if not 2 <= len(replacement_coords) <= 5000 or any(
+                not math.isfinite(x) or not math.isfinite(y) or abs(x) > 180 or abs(y) > 90
+                for x, y in replacement_coords
+            ):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "provide a revision and 2-5000 valid replacement points")
+        if ctx.store.revision() != revision:
+            raise HTTPException(409, "project changed; select the road portion again")
+        ref, geom, start_m, end_m, anchors, _, base, idx = partial_geometry_selection(body)
+        replacement = gpd.GeoSeries(
+            [shapely.geometry.LineString(replacement_coords)], crs=4326
+        ).to_crs(base.crs).iloc[0]
+        direct = shapely.geometry.Point(replacement.coords[0]).distance(anchors[0]) + shapely.geometry.Point(replacement.coords[-1]).distance(anchors[1])
+        reverse = shapely.geometry.Point(replacement.coords[0]).distance(anchors[1]) + shapely.geometry.Point(replacement.coords[-1]).distance(anchors[0])
+        coords = list(replacement.coords)
+        if reverse < direct:
+            coords.reverse()
+            direct = reverse
+        if direct > 4:
+            raise HTTPException(400, "the replacement must start and finish at the two fixed anchors")
+        coords[0], coords[-1] = anchors[0].coords[0], anchors[1].coords[0]
+        if isinstance(idx, dict):                  # A and B on different sections of the road
+            return save_stretch(idx, anchors, coords, base, revision, body.get("end_review") == "uncertain")
+        from shapely.ops import substring
+        before = list(substring(geom, 0, start_m).coords)
+        after = list(substring(geom, end_m, geom.length).coords)
+        moves = {}                                 # an off-line anchor at an end of the section: that node moves to it
+        if start_m < .5 and anchors[0].distance(geom.interpolate(start_m)) > .01:
+            before, moves[idx[0]] = [coords[0]], anchors[0]
+        if geom.length - end_m < .5 and anchors[1].distance(geom.interpolate(end_m)) > .01:
+            after, moves[idx[1]] = [coords[-1]], anchors[1]
+        def off(point, joint):                     # where an off-line anchor rejoins the old line
+            return [] if shapely.geometry.Point(joint).distance(point) < .01 else [joint]
+        combined = before[:-1] + off(anchors[0], before[-1]) + coords + off(anchors[1], after[0]) + after[1:]
+        line = shapely.geometry.LineString(combined)
+        if line.length < .5 or not line.is_simple:
+            raise HTTPException(400, "the corrected road must not cross itself")
+        full_wgs = gpd.GeoSeries([line], crs=base.crs).to_crs(4326).iloc[0]
+        uncertain_end = None
+        if body.get("end_review") == "uncertain":
+            point = gpd.GeoSeries([anchors[1]], crs=base.crs).to_crs(4326).iloc[0]
+            uncertain_end = {"lon": float(point.x), "lat": float(point.y), "note": "path beyond B is unclear"}
+        try:
+            if moves:
+                to_wgs = Transformer.from_crs(base.crs, 4326, always_xy=True)
+                ctx.store.set_road_stretch({ref: list(map(list, full_wgs.coords))},
+                                           {int(n): list(to_wgs.transform(p.x, p.y)) for n, p in moves.items()},
+                                           revision, me(), reviews={ref: uncertain_end})
+            else:
+                ctx.store.set_road_geometry(ref, list(map(list, full_wgs.coords)), revision, me(), uncertain_end=uncertain_end)
+        except Conflict:
+            raise HTTPException(409, "project changed; select the road portion again")
+        return {"status": ctx.store.status(me()), "replaced_m": round(end_m - start_m, 2), "uncertain": uncertain_end is not None}
+
     def cut_preview(body: dict) -> tuple[dict, dict]:
         try:
             ref = str(body['ref'])
@@ -824,6 +1123,34 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         except Conflict:
             raise HTTPException(409, 'project changed; select the section again')
         return {'status': ctx.store.status(me()), 'removed_m': preview['properties']['removed_m']}
+
+    @app.post('/api/roads/review')
+    def post_road_review(body: dict = Body(...)):
+        """Mark an interval on a road as unclear without changing its geometry."""
+        if body.get('revision') != ctx.store.revision():
+            raise HTTPException(409, 'project changed; select the unclear portion again')
+        _, preview = cut_preview(body)
+        review = {'id': uuid.uuid4().hex, 'ref': str(body['ref']), 'selected_m': preview['properties']['removed_m'],
+                  'note': str(body.get('note') or 'Road or path unclear in imagery')[:500], 'geometry': preview['geometry']}
+        try:
+            ctx.store.add_road_review(review, int(body['revision']), me())
+        except Conflict:
+            raise HTTPException(409, 'project changed; select the unclear portion again')
+        return {'status': ctx.store.status(me()), 'review': review}
+
+    @app.post('/api/roads/review/remove')
+    def post_road_review_remove(body: dict = Body(...)):
+        """Resolve unclear-road interval marks without changing road geometry."""
+        ids = [str(value) for value in body.get('ids', [])]
+        if not ids:
+            raise HTTPException(400, 'choose at least one unclear portion')
+        try:
+            ctx.store.remove_road_reviews(ids, int(body['revision']), me())
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, 'provide the current project revision')
+        except Conflict:
+            raise HTTPException(409, 'project changed; reload the unclear portions')
+        return {'status': ctx.store.status(me()), 'removed': len(ids)}
 
     def join_preview(body: dict):
         try:
@@ -882,7 +1209,7 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
     @app.post('/api/work-areas/grid')
     def post_area_grid(body: dict = Body(...)):
         p = ctx.store.project()
-        if p.work_areas.get('features'):
+        if work_areas.grid_collection(p.work_areas).get('features'):
             raise HTTPException(409, 'a work grid already exists; keep its review history')
         base = ctx.get_base()
         aoi = engine.aoi_polygon(base)
@@ -892,12 +1219,64 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
             raise HTTPException(400, 'this project needs an area boundary before creating a grid')
         try:
             size = body.get('cell_m', 'auto')
-            areas = work_areas.make_grid(aoi, base.crs, 'auto' if size == 'auto' else float(size))
+            grid = work_areas.make_grid(aoi, base.crs, 'auto' if size == 'auto' else float(size))
+            quartiers = work_areas.quartier_collection(p.work_areas)
+            areas = work_areas.make_hierarchy(grid, quartiers, base.crs) if quartiers.get('features') else grid
             ctx.store.set_work_areas(areas, int(body['revision']), me())
         except Conflict:
             raise HTTPException(409, 'project changed; reload the areas')
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(400, str(exc) or 'invalid area settings')
+        return {'areas': areas, 'status': ctx.store.status(me())}
+
+    def project_aoi():
+        """WGS84 boundary used by either work-area generator."""
+        base = ctx.get_base()
+        aoi = engine.aoi_polygon(base)
+        if aoi is None and base.area is not None and not base.area.empty:
+            aoi = base.area.to_crs(4326).geometry.union_all()
+        if aoi is None:
+            raise HTTPException(400, 'this project needs an area boundary before creating work areas')
+        return base, aoi
+
+    def quartier_content(body: dict) -> bytes:
+        try:
+            return base64.b64decode(body['content_b64'], validate=True)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(400, 'provide a valid CSV file') from exc
+
+    @app.post('/api/work-areas/quartiers/preview')
+    def post_quartier_preview(body: dict = Body(...)):
+        """Inspect quartier spellings and point coverage without saving private CSV rows."""
+        _base, aoi = project_aoi()
+        try:
+            return work_areas.preview_quartiers(quartier_content(body), aoi,
+                                                body.get('district_column', 'district'), body.get('lat_column', 'latitude'), body.get('lon_column', 'longitude'),
+                                                body.get('use_fotouni_catalog', True))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc) or 'invalid quartier CSV')
+
+    @app.post('/api/work-areas/quartiers')
+    def post_quartiers(body: dict = Body(...)):
+        """Save human-reviewed provisional quartier polygons as the work areas (one undoable edit)."""
+        p = ctx.store.project()
+        if work_areas.quartier_collection(p.work_areas).get('features') and body.get('replace') is not True:
+            raise HTTPException(409, 'quartier areas already exist; explicitly confirm their replacement')
+        base, aoi = project_aoi()
+        try:
+            quartiers = work_areas.make_quartiers(quartier_content(body), aoi, base.crs, body.get('mapping'),
+                                                  body.get('district_column', 'district'), body.get('lat_column', 'latitude'), body.get('lon_column', 'longitude'),
+                                                  body.get('use_fotouni_catalog', True))
+            quartiers['source']['filename'] = Path(str(body.get('filename') or 'quartiers.csv')).name[:200]
+            grid = work_areas.grid_collection(p.work_areas)
+            if not grid.get('features'):
+                grid = work_areas.make_grid(aoi, base.crs, 'auto')
+            areas = work_areas.make_hierarchy(grid, quartiers, base.crs)
+            ctx.store.set_work_areas(areas, int(body['revision']), me())
+        except Conflict:
+            raise HTTPException(409, 'project changed; preview the quartiers again')
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc) or 'invalid quartier settings')
         return {'areas': areas, 'status': ctx.store.status(me())}
 
     @app.post('/api/work-areas/status')
@@ -907,17 +1286,93 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         cell = next((f for f in areas.get('features', []) if f['properties']['id'] == body.get('id')), None)
         if cell is None:
             raise HTTPException(404, 'no such work area')
-        if body.get('status') not in work_areas.STATUSES:
-            raise HTTPException(400, 'invalid review status')
         if not isinstance(body.get('note', ''), str) or len(body.get('note', '')) > 2000:
             raise HTTPException(400, 'area note must be at most 2000 characters')
-        cell['properties'].update(status=body['status'], note=body.get('note', ''))
+        stages = work_areas.ensure_stages(cell['properties'])
+        if isinstance(body.get('stages'), dict):
+            for name, value in body['stages'].items():
+                if name not in work_areas.STAGE_STATUSES or value not in work_areas.STAGE_STATUSES[name]:
+                    raise HTTPException(400, f'invalid {name} review status')
+                stages[name] = value
+        elif body.get('status') in work_areas.STATUSES:             # compatibility with the earlier one-status interface/API
+            stages['geometry'] = {'unreviewed': 'not_started', 'in_progress': 'in_progress', 'reviewed': 'reviewed', 'needs_review': 'needs_review'}[body['status']]
+        else:
+            raise HTTPException(400, 'provide the review stages')
+        cell['properties'].update(status=work_areas.overall_status(stages), stages=stages, note=body.get('note', ''))
         try:
             ctx.store.set_work_areas(areas, int(body['revision']), me())
         except (KeyError, ValueError, TypeError):
             raise HTTPException(400, 'provide the current revision')
         except Conflict:
             raise HTTPException(409, 'project changed; reload the areas')
+        return {'status': ctx.store.status(me())}
+
+    @app.get('/api/work-areas/boundaries')
+    def get_area_boundaries(area_id: str):
+        """List the selected quartier's shared borders, ready for topology-safe editing."""
+        try:
+            options = work_areas.boundary_options(work_areas.quartier_collection(ctx.store.project().work_areas), area_id, ctx.get_base().crs)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {'area_id': area_id, 'neighbours': options, 'revision': ctx.store.revision()}
+
+    @app.get('/api/work-areas/shared-boundaries')
+    def get_shared_area_boundaries():
+        """Unique hoverable boundaries carrying the names of both adjacent quartiers."""
+        return work_areas.shared_boundaries(work_areas.quartier_collection(ctx.store.project().work_areas), ctx.get_base().crs)
+
+    @app.post('/api/work-areas/boundary')
+    def post_area_boundary(body: dict = Body(...)):
+        """Reshape one shared quartier border without changing the combined covered area."""
+        try:
+            current = ctx.store.project().work_areas
+            quartiers = work_areas.reshape_boundary(work_areas.quartier_collection(current), str(body['area_id']),
+                                                     str(body['neighbour_id']), body['coords'], body.get('reason', ''),
+                                                     ctx.get_base().crs)
+            grid = work_areas.grid_collection(current)
+            areas = work_areas.make_hierarchy(grid, quartiers, ctx.get_base().crs)
+            ctx.store.set_work_areas(areas, int(body['revision']), me())
+        except Conflict:
+            raise HTTPException(409, 'project changed; reload the quartier boundary')
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc) or 'invalid quartier boundary')
+        return {'areas': areas, 'status': ctx.store.status(me())}
+
+    @app.get('/api/roads/check')
+    def get_road_check(area: str | None = None):
+        """The road check of a work area or quartier (``area`` id; none: the whole map), see ``road_check``."""
+        p = ctx.store.project()
+        polygon = road_check.area_polygon(p, area)
+        if area and polygon is None:
+            raise HTTPException(404, 'no such work area')
+        base, res = ctx.get_effective(p)
+        issues = road_check.check_roads(base, res.report if res is not None else {}, p, polygon)
+        counts: dict = {}
+        for issue in issues:
+            if not issue['ok']:
+                counts[issue['kind']] = counts.get(issue['kind'], 0) + 1
+        return {'revision': ctx.store.revision(), 'area': area, 'issues': issues, 'counts': counts,
+                'ok': sum(1 for issue in issues if issue['ok'])}
+
+    @app.post('/api/roads/check/ok')
+    def post_road_check_ok(body: dict = Body(...)):
+        """Mark road check problems "OK as is" (``{"ids": [...], "ok": true}``) or list them again (``"ok": false``)."""
+        ids = [str(value) for value in body.get('ids', [])]
+        if not ids:
+            raise HTTPException(400, 'choose at least one problem')
+        ctx.store.set_check_ok(ids, body.get('ok', True) is not False, me())
+        return {'status': ctx.store.status(me())}
+
+    @app.post('/api/roads/stale/clear')
+    def post_clear_stale_roads(body: dict = Body(...)):
+        """Remove reviewed stale cut/join operations as one traceable maintenance edit."""
+        try:
+            ctx.store.remove_road_operations(body['ids'], body.get('reason', ''), int(body['revision']), me())
+        except Conflict:
+            raise HTTPException(409, 'project changed; recompute and review the stale roads again')
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc) or 'invalid stale-road cleanup')
+        ctx.invalidate()
         return {'status': ctx.store.status(me())}
 
     @app.post("/api/streets/assign")
@@ -1015,6 +1470,100 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
                                                 "paved": None if pd.isna(r.paved) else bool(r.paved)})
         return out
 
+    def street_edge_refs(original: int, part: int | None = None) -> list[str]:
+        """Stable references of every real edge currently displayed as one street or cut part."""
+        if ctx.network is None:
+            raise HTTPException(409, "compute the network first")
+        streets = ctx.network.streets_gdf
+        mask = streets["street_id_original"].astype(int) == int(original)
+        if part is not None:
+            mask &= streets["street_part"].astype(int) == int(part)
+        ids = set(streets.loc[mask, "street_id"].astype(int))
+        if not ids:
+            raise HTTPException(404, "street or part not found")
+        edges = ctx.network.edges.reset_index()
+        edges = edges[(edges["key"] < roads_mod.SYNTHETIC_KEY) & edges["street_id"].isin(ids)]
+        return sorted({roads_mod.edge_ref(int(r.u), int(r.v), int(r.key)) for r in edges.itertuples()})
+
+    def access_routes(a: dict, b: dict) -> dict:
+        """Two shortest node-distinct routes after snapping A and B to network nodes."""
+        import itertools
+        import networkx as nx
+
+        base, _ = ctx.get_effective()
+        rows = base.edges.reset_index()
+        rows = rows[rows["key"] < roads_mod.SYNTHETIC_KEY].copy()
+        rows["ref"] = [roads_mod.edge_ref(int(u), int(v), int(k)) for u, v, k in zip(rows.u, rows.v, rows.key)]
+        rows = rows.drop_duplicates("ref")
+        touched = sorted(set(rows.u.astype(int)) | set(rows.v.astype(int)))
+        if not touched:
+            raise HTTPException(409, "the network has no edges")
+        nodes = base.nodes.loc[touched]
+        transform = Transformer.from_crs(4326, base.crs, always_xy=True)
+
+        def snap(point: dict) -> int:
+            x, y = transform.transform(float(point["lon"]), float(point["lat"]))
+            dist = (nodes["x"].astype(float) - x) ** 2 + (nodes["y"].astype(float) - y) ** 2
+            return int(dist.idxmin())
+
+        start, end = snap(a), snap(b)
+        if start == end:
+            raise HTTPException(400, "A and B snap to the same network node")
+        graph = nx.Graph()
+        by_ref = {}
+        for row in rows.itertuples():
+            ref, length = str(row.ref), float(row.geometry.length)
+            by_ref[ref] = row
+            if graph.has_edge(int(row.u), int(row.v)) and graph[int(row.u)][int(row.v)]["length"] <= length:
+                continue
+            graph.add_edge(int(row.u), int(row.v), length=length, ref=ref)
+        try:
+            node_paths = list(itertools.islice(nx.shortest_simple_paths(graph, start, end, weight="length"), 2))
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            raise HTTPException(409, "there is no route between A and B")
+        back = Transformer.from_crs(base.crs, 4326, always_xy=True)
+        routes = []
+        for index, nodes_path in enumerate(node_paths):
+            refs = [graph[u][v]["ref"] for u, v in zip(nodes_path, nodes_path[1:])]
+            features = []
+            for ref in refs:
+                row = by_ref[ref]
+                geom = gpd.GeoSeries([row.geometry], crs=base.crs).to_crs(4326).iloc[0]
+                value = getattr(row, "access", None)
+                value = None if value is None or pd.isna(value) else str(value)
+                features.append({"type": "Feature", "properties": {"ref": ref, "access": value},
+                                 "geometry": shapely.geometry.mapping(shapely.set_precision(geom, 1e-6))})
+            routes.append({"index": index, "refs": refs, "nodes": nodes_path,
+                           "length_m": round(sum(float(graph[u][v]["length"]) for u, v in zip(nodes_path, nodes_path[1:])), 1),
+                           "geometry": {"type": "FeatureCollection", "features": features}})
+        sx, sy = float(nodes.loc[start, "x"]), float(nodes.loc[start, "y"])
+        ex, ey = float(nodes.loc[end, "x"]), float(nodes.loc[end, "y"])
+        slon, slat = back.transform(sx, sy); elon, elat = back.transform(ex, ey)
+        return {"revision": ctx.store.revision(), "a": {"node": start, "lat": slat, "lon": slon},
+                "b": {"node": end, "lat": elat, "lon": elon}, "routes": routes}
+
+    @app.post("/api/edges/access/path")
+    def post_edge_access_path(body: dict = Body(...)) -> dict:
+        return access_routes(body["a"], body["b"])
+
+    @app.post("/api/edges/access")
+    def post_edge_access(body: dict = Body(...)) -> dict:
+        value = body.get("access")
+        if value not in ("car", "foot", None):                 # car = drivable, foot = not drivable (todo 2.1)
+            raise HTTPException(400, "access must be car (drivable), foot (not drivable) or null")
+        refs = [str(ref) for ref in body.get("refs", [])]
+        if not refs:
+            raise HTTPException(400, "choose at least one edge")
+        base, _ = ctx.get_effective()
+        available = {roads_mod.edge_ref(u, v, k) for u, v, k in base.edges.index if k < roads_mod.SYNTHETIC_KEY}
+        if not set(refs) <= available:
+            raise HTTPException(409, "the route changed; select A and B again")
+        try:
+            ctx.store.set_edge_access({ref: value for ref in refs}, int(body["revision"]), me())
+        except Conflict as exc:
+            raise HTTPException(409, str(exc))
+        return {"changed": len(set(refs)), "access": value, "status": ctx.store.status(me())}
+
     @app.post("/api/streets/attrs")
     def post_street_attrs(body: dict = Body(...)) -> dict:
         """Change the rank (0-5), the drivable flag or the paved flag of a street: ``{"original": id, "part"?, "rank"?, "drivable"?, "paved"?}`` (``part``: only that part of a cut street)."""
@@ -1023,11 +1572,16 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
             if int(body["rank"]) not in engine.RANK_HIGHWAY:
                 raise HTTPException(400, "rank must be 0 to 5")
             a["rank"] = int(body["rank"])
-        for k in ("drivable", "paved"):
-            if k in body:
-                a[k] = None if body[k] is None else bool(body[k])           # null = unknown
+        if "paved" in body:
+            a["paved"] = None if body["paved"] is None else bool(body["paved"])
+        if "addresses" in body:                                      # False: a path whose houses take the number where it leaves the street
+            a["addresses"] = body["addresses"] is not False
         key = str(int(body["original"])) + (f":{int(body['part'])}" if body.get("part") is not None else "")        # "114:2": only part 2 of street 114
         ctx.store.set_street_attrs({key: a}, me())
+        if "drivable" in body:
+            value = None if body["drivable"] is None else ("car" if bool(body["drivable"]) else "foot")
+            refs = street_edge_refs(int(body["original"]), int(body["part"]) if body.get("part") is not None else None)
+            ctx.store.set_edge_access({ref: value for ref in refs}, None, me())
         return {"status": ctx.store.status(me())}
 
     @app.post("/api/streets/attrs/import")
@@ -1087,6 +1641,18 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
             raise HTTPException(400, "rank must be 0 to 3")
         ids = body.get("ids") or [body["id"]]
         ctx.store.set_point_ranks({str(i): rank for i in ids}, me())
+        return {"status": ctx.store.status(me())}
+
+    @app.post("/api/houses/quartier")
+    def post_house_quartier(body: dict = Body(...)) -> dict:
+        """Correct the survey quartier of houses: ``{"ids": [...], "quartier": "Mving"}`` (a catalogue name; empty: back to the survey)."""
+        ids = [str(i) for i in body.get("ids") or []]
+        q = str(body.get("quartier") or "").strip()
+        if not ids:
+            raise HTTPException(400, "choose houses")
+        if q and plate_mod.quartier_trigram(q) is None:
+            raise HTTPException(400, f"{q} is not a quartier of the list (Overview Abbreviations)")
+        ctx.store.set_house_quartiers({i: q or None for i in ids}, me())
         return {"status": ctx.store.status(me())}
 
     @app.post("/api/edges/remove")
@@ -1206,6 +1772,9 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         """The computed network (street ids, names, status, plan)."""
         if ctx.network_json is None:
             return JSONResponse({"detail": "not computed yet"}, status_code=409)
+        no_addr = engine.no_address_streets(ctx.network.streets_gdf, ctx.store.project().roads.get("attrs")) if ctx.network is not None else set()
+        for f in ctx.network_json["streets"]["features"]:
+            f["properties"]["addresses"] = f["properties"]["id"] not in no_addr
         return ctx.network_json
 
     @app.post("/api/addresses/compute")
@@ -1220,13 +1789,209 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
         """House addresses and street signs."""
         if ctx.addresses is None:
             return JSONResponse({"detail": "not computed yet"}, status_code=409)
-        a = ctx.addresses
-        return {"houses": _fc(a.houses, ["building_id", "address", "number", "street_id", "street", "side", "side_source", "road_lat", "road_lon", "azimuth", "status", "distance_m", "address_id", "source", "use", "name", "residents", "sign_rank",
-                                    "access_lat", "access_lon"]),
+        a = registered()
+        reg = ctx.store.project().register
+        hs = a.houses.copy()
+        hs["plaque_name"] = plaque_names(hs)
+        return {"houses": _fc(hs, ["building_id", "address", "plate", "street_code", "quartier_code", "plaque_name", "number", "street_id", "street", "side", "side_source", "road_lat", "road_lon", "azimuth", "status", "distance_m", "address_id", "source", "district", "survey_district", "survey_type", "use", "name", "service", "residents", "workers", "review", "sign_rank",
+                                    "access_lat", "access_lon", "via_path", "code", "register_status", "computed_address", "computed_plate", "changed", "approved_at", "approved_by"]),
+                "register": {"approved": sum(1 for r in reg.values() if r.get("status") == "approved"),
+                             "retired": sum(1 for r in reg.values() if r.get("status") == "retired"),
+                             "changed": int(a.houses["changed"].sum())},
                 "signs": {"type": "FeatureCollection", "features": [
                     {"type": "Feature", "properties": {"node_id": int(r.node_id), "labels": list(r.labels), "rank": r["rank"], "pois": list(r.pois), "spokes": list(r.spokes), "street_ids": str(r.street_ids or "")},
                      "geometry": shapely.geometry.mapping(r.geometry)} for _, r in a.signs.iterrows()]},
                 "stats": a.stats, "warnings": a.warnings}
+
+    def registered(reopen: set | None = None) -> engine.AddressState:
+        """The computed addresses with the register applied: approved addresses never change (see ``engine.apply_register``).
+
+        Args:
+            reopen: Building ids treated as not approved (to correct them: they get the address computed now).
+        """
+        a = ctx.addresses
+        reg = ctx.store.project().register
+        if reopen:
+            reg = {k: v for k, v in reg.items() if k not in reopen}
+        return engine.AddressState(engine.apply_register(a.houses, reg), a.signs, a.stats, a.warnings)
+
+    def household_table() -> dict:
+        """The survey rows of ``input/households.csv`` (family names and private contacts), re-read when the file changes."""
+        path = ctx.store.project().input_dir / households_mod.FILE
+        stamp = path.stat().st_mtime if path.exists() else None
+        if getattr(ctx, "_households_stamp", "unset") != stamp:
+            ctx._households, ctx._households_stamp = households_mod.load(ctx.store.project().root), stamp
+        return ctx._households
+
+    def plaque_names(h) -> list:
+        """The name printed on each house's plaque (family name, else business or public place name)."""
+        t = household_table()
+        return [households_mod.plaque_name(households_mod.for_building(t, b), nm if isinstance(nm, str) else None)
+                for b, nm in zip(h["building_id"], h["name"] if "name" in h.columns else [None] * len(h))]
+
+    def house_rows(ids: set | None = None, reopen: bool = False) -> list[dict]:
+        """Current addresses (register applied) as plain rows, optionally only some buildings (``reopen``: as computed now)."""
+        if ctx.addresses is None:
+            raise HTTPException(409, "compute the addresses first (Addresses tab)")
+        h = registered(ids if reopen else None).houses
+        if ids is not None:
+            h = h[h["building_id"].astype(str).isin(ids)]
+        pts = h.geometry.apply(lambda g: g if g.geom_type == "Point" else g.representative_point())
+        names = plaque_names(h)
+        cat = {e["code"]: e["name"] for e in work_areas.fotouni_catalog()["entries"]}
+        rows = []
+        for (_, r), pt, nm in zip(h.iterrows(), pts, names):
+            b = str(r["building_id"])
+            clean = lambda v: None if v is None or (isinstance(v, float) and v != v) else (v.item() if hasattr(v, "item") else v)  # noqa: E731
+            rows.append({"building_id": b, "address": clean(r.get("address")), "plate": clean(r.get("plate")), "street_code": clean(r.get("street_code")),
+                         "number": clean(r.get("number")), "street": clean(r.get("street")),
+                         "street_id": clean(r.get("street_id")), "status": clean(r.get("status")), "register_status": clean(r.get("register_status")),
+                         "code": clean(r.get("code")), "computed_address": clean(r.get("computed_address")), "computed_plate": clean(r.get("computed_plate")),
+                         "changed": bool(r.get("changed")), "district": clean(r.get("district")), "quartier_code": clean(r.get("quartier_code")),
+                         "quartier_name": cat.get(clean(r.get("quartier_code"))), "plaque_name": nm, "use": clean(r.get("use")),
+                         "address_id": clean(r.get("address_id")), "lat": round(float(pt.y), 7), "lon": round(float(pt.x), 7),
+                         "road_lat": clean(r.get("road_lat")), "road_lon": clean(r.get("road_lon"))})
+        return rows
+
+    def houses_in_area(area_id: str) -> set:
+        """Building ids inside a work area (grid cell or quartier)."""
+        areas = ctx.store.project().work_areas
+        feats = work_areas.grid_collection(areas).get("features", []) + work_areas.quartier_collection(areas).get("features", [])
+        cell = next((f for f in feats if f["properties"].get("id") == area_id), None)
+        if cell is None:
+            raise HTTPException(404, "no such work area")
+        shape = shapely.geometry.shape(cell["geometry"])
+        h = ctx.addresses.houses
+        pts = h.geometry.apply(lambda g: g if g.geom_type == "Point" else g.representative_point())
+        return {str(b) for b, pt in zip(h["building_id"], pts) if shape.covers(pt)}
+
+    @app.get("/api/register")
+    def get_register() -> dict:
+        """The address register: every approved or retired address, with its history, and the approved ones the map would now change."""
+        reg = ctx.store.project().register
+        now = {r["building_id"]: r for r in house_rows(set(reg))} if ctx.addresses is not None else {}
+        rows = [{"building_id": b, **{k: v for k, v in r.items() if k != "history"}, "history": r.get("history", []),
+                 "computed_address": now.get(b, {}).get("computed_address"), "changed": now.get(b, {}).get("changed", False)}
+                for b, r in sorted(reg.items(), key=lambda kv: str(kv[1].get("code") or ""))]
+        return {"rows": rows, "approved": sum(1 for r in rows if r["status"] == "approved"), "retired": sum(1 for r in rows if r["status"] == "retired"),
+                "changed": [r for r in rows if r["changed"] and r["status"] == "approved"]}
+
+    @app.get("/api/register.csv")
+    def get_register_csv() -> Response:
+        """The register as CSV (one row per approved or retired address)."""
+        rows = get_register()["rows"]
+        cols = ["plate", "code", "building_id", "status", "address", "number", "street", "street_id", "quartier_code", "lat", "lon", "approved_at",
+                "approved_by", "computed_address", "changed"]
+        return _csv([{c: r.get(c) for c in cols} for r in rows], cols)
+
+    def change_rows() -> list[dict]:
+        """Address changes: those waiting for validation (the map now gives a validated house another address) and those validated."""
+        reg = ctx.store.project().register
+        now = {r["building_id"]: r for r in house_rows(set(reg))} if ctx.addresses is not None else {}
+        t = household_table()
+        out = []
+        for b, r in reg.items():
+            hh = households_mod.for_building(t, b) or {}
+            base = {"building_id": b, "code": r.get("code"), "address_id": now.get(b, {}).get("address_id"),
+                    "plaque_name": now.get(b, {}).get("plaque_name") or households_mod.plaque_name(hh),
+                    "contact_name": hh.get("contact_name") or None, "contact_phone": hh.get("contact_phone") or hh.get("commerce_phone") or None,
+                    "lat": r.get("lat"), "lon": r.get("lon"), "quartier_code": r.get("quartier_code")}
+            if r.get("status") == "approved" and now.get(b, {}).get("changed"):
+                out.append({**base, "state": "to_validate", "before_plate": r.get("plate"), "after_plate": now[b].get("computed_plate"),
+                            "before_address": r.get("address"), "after_address": now[b].get("computed_address"), "when": None, "by": None, "reason": None})
+            for step in r.get("history", []):
+                if step.get("action") == "corrected":
+                    out.append({**base, "state": "validated", "before_plate": step.get("before_plate"), "after_plate": step.get("plate"),
+                                "before_address": step.get("before_address"), "after_address": step.get("address"), "when": step.get("ts"),
+                                "by": step.get("user"), "reason": step.get("reason")})
+        return sorted(out, key=lambda x: (x["state"] != "to_validate", str(x["when"] or ""), str(x["before_plate"] or "")))
+
+    @app.get("/api/register/changes")
+    def get_register_changes() -> dict:
+        """Address changes, without the private contacts (see ``/api/register/changes.csv`` for the list to inform families)."""
+        rows = [{k: v for k, v in r.items() if k not in ("contact_name", "contact_phone")} for r in change_rows()]
+        return {"rows": rows, "to_validate": sum(1 for r in rows if r["state"] == "to_validate"),
+                "validated": sum(1 for r in rows if r["state"] == "validated")}
+
+    @app.get("/api/register/changes.csv")
+    def get_register_changes_csv() -> Response:
+        """Address changes before / after, with the family name, contact and position: the list to inform each family (administrators)."""
+        cols = ["state", "plaque_name", "contact_name", "contact_phone", "before_plate", "after_plate", "before_address", "after_address", "quartier_code",
+                "lat", "lon", "address_id", "code", "building_id", "when", "by", "reason"]
+        return _csv([{c: r.get(c) for c in cols} for r in change_rows()], cols)
+
+    @app.get("/api/households/{building_id}")
+    def get_household(building_id: str) -> dict:
+        """The survey details of one building, contacts included (administrators only: never printed or put in the QR code)."""
+        row = households_mod.for_building(household_table(), building_id)
+        if row is None:
+            raise HTTPException(404, "no survey record for this building (import the survey export: import-households)")
+        return {**row, "plaque_name": households_mod.plaque_name(row)}
+
+    @app.post("/api/register/approve")
+    def post_register_approve(body: dict = Body(...)) -> dict:
+        """Validate addresses: ``{"ids": [...]}`` or ``{"area": "R03C07"}``; ``correct`` + ``reason`` to validate a change of a
+        validated address (``changed``: every such change, or those of the ids / area given).
+
+        Only complete addresses can be validated: a house without a road, or whose quartier has no trigram, is skipped.
+        """
+        if ctx.addresses is None:
+            raise HTTPException(409, "compute the addresses first (Addresses tab)")
+        if ctx.addresses_hash != ctx.store.project().address_hash():
+            raise HTTPException(409, "the addresses are out of date: compute them again before approving")
+        ids = {str(i) for i in body.get("ids") or []}
+        if body.get("area"):
+            ids |= houses_in_area(str(body["area"]))
+        if body.get("changed"):                                    # every validated address the map would now change
+            rh = registered().houses
+            changed = {str(b) for b, c, s in zip(rh["building_id"], rh["changed"], rh["register_status"]) if c and s == "approved"}
+            ids = (ids & changed) if (body.get("ids") or body.get("area")) else changed
+        if not ids:
+            raise HTTPException(400, "choose houses or a work area")
+        rows = house_rows(ids, reopen=bool(body.get("correct")))
+        ready = {r["building_id"]: r for r in rows if r["plate"] and r["use"] != "reference"}
+        skipped = sorted(set(ids) - set(ready))
+        try:
+            out = ctx.store.approve_addresses(ready, me(), reason=str(body.get("reason") or ""), correct=bool(body.get("correct")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {**{k: len(v) for k, v in out.items()}, "skipped": len(skipped), "skipped_ids": skipped[:50], "status": ctx.store.status(me())}
+
+    @app.post("/api/register/retire")
+    def post_register_retire(body: dict = Body(...)) -> dict:
+        """Retire approved addresses (a demolished house): ``{"ids": [...], "reason": "..."}``. The code is never given again."""
+        try:
+            done = ctx.store.retire_addresses(body.get("ids") or [], str(body.get("reason") or ""), me())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"retired": len(done), "status": ctx.store.status(me())}
+
+    @app.get("/api/plaque/{building_id}.svg")
+    def get_plaque(building_id: str) -> Response:
+        """The plaque of a house as SVG at real size (200 x 250 mm). A house that is not approved gets a draft plaque."""
+        rows = house_rows({str(building_id)})
+        if not rows:
+            raise HTTPException(404, "no such house")
+        r = rows[0]
+        if not r["number"]:
+            raise HTTPException(409, "this house has no address yet")
+        svg = plaque.plaque_svg(r["plate"], r["plaque_name"], r["lat"], r["lon"], quartier=r["quartier_code"], draft=r["register_status"] != "approved")
+        name = (r["plate"] or str(building_id)).replace(" ", "_").replace("(", "").replace(")", "")
+        return Response(svg, media_type="image/svg+xml", headers={"Content-Disposition": f'inline; filename="plaque_{name}.svg"'})
+
+    @app.get("/api/card/{building_id}.svg")
+    def get_card(building_id: str) -> Response:
+        """The address card of a house (85.6 x 54 mm), same content as the plaque; a draft until the address is validated."""
+        rows = house_rows({str(building_id)})
+        if not rows:
+            raise HTTPException(404, "no such house")
+        r = rows[0]
+        if not r["number"]:
+            raise HTTPException(409, "this house has no address yet")
+        svg = plaque.card_svg(r["plate"], r["plaque_name"], r["lat"], r["lon"], quartier=r["quartier_code"], quartier_name=r["quartier_name"],
+                              draft=r["register_status"] != "approved")
+        name = (r["plate"] or str(building_id)).replace(" ", "_").replace("(", "").replace(")", "")
+        return Response(svg, media_type="image/svg+xml", headers={"Content-Disposition": f'inline; filename="carte_{name}.svg"'})
 
     @app.get("/api/export/edges.kml")
     def export_edges_kml() -> Response:
@@ -1315,7 +2080,7 @@ def create_app(root: Path, auto_compute: bool = True, db_url: str | None = None,
                 raise HTTPException(409, "compute the addresses first (Addresses tab)")
             if kind == "signs":
                 return serve_table(exports.signs_table(ctx.addresses, ctx.network), "signs", fmt)
-            return serve_table(exports.buildings_table(ctx.addresses, ctx.get_base().points), "buildings", fmt)
+            return serve_table(exports.buildings_table(registered(), ctx.get_base().points), "buildings", fmt)
         if kind == "osm" and fmt == "osm":
             t = tables()
             path = ctx.store.project().input_dir / "streets.osm"

@@ -25,6 +25,8 @@ examples/*/streets.csv
 projects/*/project.db*
 projects/*/computed/
 projects/*/exports/
+# survey family names and phone numbers (personal data): never versioned
+**/input/households.csv
 
 # review screenshots and PDFs are shared separately, not versioned
 docs/review/

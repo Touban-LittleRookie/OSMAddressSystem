@@ -5,6 +5,7 @@
 * ``setup --project DIR [--force]`` builds ``network/`` from ``input/streets.osm`` (and ``input/area.gpkg``).
 * ``serve --project DIR [--host 127.0.0.1] [--port 8000] [--db URL]`` starts the app (one worker).
 * ``backup --project DIR --to FILE`` copies the SQLite database.
+* ``import-households --project DIR --csv FILE`` copies family names and contacts of the EFYL export into ``input/households.csv``.
 """
 
 from __future__ import annotations
@@ -41,12 +42,18 @@ def main(argv: list[str] | None = None) -> None:
     v.add_argument("--host", default="127.0.0.1")
     v.add_argument("--port", type=int, default=8000)
     v.add_argument("--db", default=None, help="database URL (default: project.db, or $ADDRESS_DB_URL), e.g. postgresql+psycopg://user:pw@host/db")
+    v.add_argument("--root-path", default=os.environ.get("ADDRESS_ROOT_PATH", ""), help="URL prefix used by a reverse proxy (default: $ADDRESS_ROOT_PATH)")
+    v.add_argument("--forwarded-allow-ips", default=os.environ.get("ADDRESS_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+                   help="trusted proxy IPs for Forwarded/X-Forwarded headers (default: $ADDRESS_FORWARDED_ALLOW_IPS or 127.0.0.1)")
     account=sub.add_parser('account',help='create the initial administrator or recover an account locally')
     account.add_argument('--project',type=Path,required=True)
     account.add_argument('--db',default=None)
     account.add_argument('--username',required=True)
     account.add_argument('--name',required=True)
     account.add_argument('--recover',action='store_true',help='reset this account and revoke its sessions; local operator access required')
+    hh = sub.add_parser("import-households", help="copy family names and contacts from the EFYL admin export into input/households.csv")
+    hh.add_argument("--project", type=Path, required=True)
+    hh.add_argument("--csv", type=Path, required=True, help="efyl_admin_export_*.csv")
     for name, hlp in (("backup", "copy the SQLite database"),):
         p = sub.add_parser(name, help=hlp)
         p.add_argument("--project", type=Path, required=True)
@@ -83,6 +90,11 @@ def main(argv: list[str] | None = None) -> None:
         if a.recover:accounts.reset_local(a.username,a.name,password)
         else:accounts.bootstrap(a.username,a.name,password)
         print('Administrator account ready. Sign in through the app.')
+    elif a.cmd == "import-households":
+        from .households import import_export
+
+        got = import_export(a.csv, a.project)
+        print(f"{got['rows']} survey rows ({got['family_names']} with a family name) written to input/households.csv - personal data: never commit it")
     elif a.cmd == "backup":
         print("backup written to", Store(a.project, url=a.db).backup(a.to))
     else:
@@ -90,7 +102,8 @@ def main(argv: list[str] | None = None) -> None:
 
         from .server import create_app
 
-        uvicorn.run(create_app(a.project, db_url=a.db), host=a.host, port=a.port)
+        uvicorn.run(create_app(a.project, db_url=a.db), host=a.host, port=a.port, root_path=a.root_path,
+                    proxy_headers=True, forwarded_allow_ips=a.forwarded_allow_ips)
 
 
 if __name__ == "__main__":

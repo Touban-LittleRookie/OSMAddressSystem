@@ -10,6 +10,10 @@ services:
     environment:
       # ADDRESS_DB_URL: postgresql+psycopg://address:${POSTGRES_PASSWORD:-change-me}@db/address
       PORT: "8000"
+      # The app port is private to this Compose network/host. Trust Caddy's
+      # forwarded HTTPS information so secure sessions and origin checks work.
+      ADDRESS_FORWARDED_ALLOW_IPS: "*"
+      # ADDRESS_ROOT_PATH: "/addressbook"  # only when the proxy removes a URL prefix
   db:
     image: postgres:16
     profiles: ["postgres"]

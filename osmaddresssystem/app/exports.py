@@ -107,7 +107,8 @@ def edge_table(state, base) -> gpd.GeoDataFrame:
                             "street_part": e["street_part"].astype("Int64"), "u": nu, "v": nv,
                             "street_dist_u_m": np.round(su, 1), "street_dist_v_m": np.round(sv, 1),
                             "key": e["key"].astype("int64"), "osmid": e["osmid"].astype(str), "highway": e["highway"],
-                            "drivable": e["drivable_info"].astype("boolean") if "drivable_info" in e else e["is_drivable"].astype("boolean"),
+                            "access": e["access"].where(e["access"].notna(), None) if "access" in e else [None] * len(e),
+                            "drivable": pd.array([None if pd.isna(v) else v == "car" for v in e["access"]], dtype="boolean") if "access" in e else (e["drivable_info"].astype("boolean") if "drivable_info" in e else e["is_drivable"].astype("boolean")),
                             "paved": e["paved"].astype("boolean") if "paved" in e else pd.array([None] * len(e), dtype="boolean"), "osm": osm, "geometry_modified": mod, "new": new,
                             "geom_edited": e["geom_edited"].astype(bool) if "geom_edited" in e else False,
                             "dist_u_m": d_u, "dist_v_m": d_v, "length_m": [round(g.length, 2) for g in geoms]}, geometry=geoms, crs=state.edges.crs)
@@ -151,13 +152,17 @@ def street_table(state, project, base, edges: gpd.GeoDataFrame) -> gpd.GeoDataFr
             own = re.sub(r" \([A-Z]+\)$", "", own)                   # the part letter is not part of the street's name
         st = status.loc[sid]
         derived = st["status"] == "derived"
+        access_values = [] if eg is None or "access" not in eg else [(None if pd.isna(v) else str(v)) for v in eg["access"]]
+        distinct_access = set(access_values)
+        street_access = (next(iter(distinct_access)) if len(distinct_access) == 1 else "mixed") if distinct_access else None
         geom = r.geometry
         if geom.geom_type == "MultiLineString":
             merged = linemerge(geom)
             geom = merged if merged.geom_type == "LineString" else geom
         rows.append({"street_id": sid, "original_id": int(r["street_id_original"]), "part": int(r["street_part"]), "rank": int(r["street_rank"]),
                      "osm": bool(n_edges) and bool(eg["osm"].all()), "geometry_modified": bool(n_edges) and bool(eg["geometry_modified"].any()),
-                     "new": bool(n_edges) and bool(eg["new"].all()), "drivable": engine._tri(eg["drivable"], eg["length_m"]) if n_edges else None,
+                     "new": bool(n_edges) and bool(eg["new"].all()), "access": street_access,
+                     "drivable": engine._tri(eg["drivable"], eg["length_m"]) if n_edges else None,
                      "paved": engine._tri(eg["paved"], eg["length_m"]) if n_edges else None,
                      "osm_name": bool(osm_txt), "modified_osm_name": bool(osm_txt) and bool(own) and own != osm_txt,
                      "derived_name": derived,
@@ -186,7 +191,7 @@ def with_street_columns(edges: gpd.GeoDataFrame, streets: gpd.GeoDataFrame) -> g
     cols = ["rank", "osm_name", "modified_osm_name", "derived_name", "derived_rank", "name_source", "street_name"]
     s = streets.set_index("street_id")[cols]
     out = edges.join(s, on="street_id")
-    front = ["street_id", "rank", "u", "v", "street_dist_u_m", "street_dist_v_m", "dist_u_m", "dist_v_m", "key", "osm", "geometry_modified", "new", "drivable", "paved"] + cols[1:]
+    front = ["street_id", "rank", "u", "v", "street_dist_u_m", "street_dist_v_m", "dist_u_m", "dist_v_m", "key", "osm", "geometry_modified", "new", "access", "drivable", "paved"] + cols[1:]
     return out[front + [c for c in out.columns if c not in front]]
 
 

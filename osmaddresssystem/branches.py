@@ -48,6 +48,40 @@ def is_named(name) -> bool:
     return bool(s) and not s.isdigit()
 
 
+_FEMININE = {"rue", "route", "place", "piste", "voie", "ruelle", "montée", "descente", "chefferie", "cité", "corniche"}
+
+
+def _of(root: str) -> str:
+    """``du Boulevard X``, ``de la Rue X``, ``de l'Avenue X``, ``du Marché`` (for ``Le Marché``): the root name after "Voie n"."""
+    r = str(root).strip()
+    for article, joined in (("Les ", "des "), ("Le ", "du "), ("La ", "de la "), ("L'", "de l'"), ("L’", "de l’")):
+        if r.startswith(article):
+            return joined + r[len(article):]
+    if r.startswith("#"):
+        return "de " + r
+    word = r.split(" ", 1)[0].lower()
+    if word[:1] in "aeiouyhàâéèêîôû":
+        return "de l'" + r
+    return ("de la " if word in _FEMININE else "du ") + r
+
+
+def written_branch_name(prefix: str, root: str) -> str:
+    """The derived name as it is shown and printed, read in walking order from the main street.
+
+    ``branch_prefix`` lists the newest branch first (``"10-447-"``: branch 10 of branch 447); people walk from the main
+    street outwards, so the written name turns the numbers round: ``Voie 447/10 du Boulevard X``.
+
+    Args:
+        prefix: ``branch_prefix`` such as ``"447-"`` or ``"10A-447-"``.
+        root: Name of the main street the chain ends at (or its ``#id`` stand-in).
+
+    Returns:
+        ``Voie 447 du Boulevard X`` for ``"447-"``, ``Voie 447/10A du Boulevard X`` for ``"10A-447-"``.
+    """
+    numbers = [p for p in str(prefix).split("-") if p]
+    return f"Voie {'/'.join(reversed(numbers))} {_of(root)}"
+
+
 def branch_depth(name: str) -> int:
     """Number of branch prefixes at the start of a derived name.
 
@@ -282,6 +316,7 @@ def assign_branch_names(
     planned_streets=None,
     use_length_rule: bool = True,
     second_level_max_drive_m: float | None = DEFAULT_SECOND_LEVEL_MAX_DRIVE_M,
+    own_name_max_rank: int | None = None,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """Name unnamed roads after the named road they branch from.
 
@@ -305,13 +340,16 @@ def assign_branch_names(
         use_length_rule: Require the derived street to be shorter than its main street.
         second_level_max_drive_m: Names of the second level and deeper (``4-3-xyz``) are only given to non-drivable roads and to
             drivable roads shorter than this many metres (None = no limit).
+        own_name_max_rank: Streets with ``street_rank`` at most this always need a name of their own and never take a derived
+            name (2 = highways, primary and secondary roads); None = no such rule.
 
     Returns:
         ``(edges_gdf, streets_df)`` copies. ``streets_df`` gains ``branch_name``,
         ``branch_parent_id``, ``branch_number``, ``branch_label`` (number plus letter when the slot is shared),
         ``branch_side``, ``branch_level``, ``branch_distance_m``, ``branch_prefix`` (``"4A-3-"``),
         ``branch_root_id`` (the main street the chain ends at), ``to_be_named`` (planned streets) and
-        ``display_name`` (own name, else branch name, else the ``#id`` stand-in). ``edges_gdf``
+        ``display_name`` (own name, else the branch name as written - ``Voie 3 du xyz``, see :func:`written_branch_name` -, else the
+        ``#id`` stand-in). ``edges_gdf``
         gains ``branch_name`` and ``display_name`` through ``street_id``.
     """
     edges = edges_gdf.copy()
@@ -337,6 +375,8 @@ def assign_branch_names(
         for s in streets["street_id"]:
             s = int(s)
             if s in names or s in new_rows or s not in leaving or (only_drivable and s not in drivable_streets):
+                continue
+            if own_name_max_rank is not None and rank.get(s, 99) <= own_name_max_rank:     # an important road needs its own name
                 continue
             if level >= 2 and s not in deep_ok:                  # a long drivable road cannot take a second-level name
                 continue
@@ -386,9 +426,9 @@ def assign_branch_names(
                 "branch_distance_m", "branch_prefix", "branch_root_id"):
         streets[col] = streets["street_id"].map(lambda s, col=col: rows.get(int(s), {}).get(col))
     streets["to_be_named"] = streets["street_id"].map(lambda s: int(s) in planned)
-    streets["display_name"] = [
-        n if is_named(n) else (b if isinstance(b, str) else (placeholder(s) if int(s) in planned else None))
-        for s, n, b in zip(streets["street_id"], streets["street_name"], streets["branch_name"])
+    streets["display_name"] = [                                # the derived name as written: Voie 447/10 du xyz
+        n if is_named(n) else (written_branch_name(pre, names[root]) if isinstance(b, str) else (placeholder(s) if int(s) in planned else None))
+        for s, n, b, pre, root in zip(streets["street_id"], streets["street_name"], streets["branch_name"], streets["branch_prefix"], streets["branch_root_id"])
     ]
     for col in ("branch_name", "display_name", "to_be_named"):
         edges[col] = edges["street_id"].map(streets.set_index("street_id")[col].to_dict())
@@ -448,8 +488,9 @@ def apply_assigned_names(edges_gdf: gpd.GeoDataFrame, streets_df: pd.DataFrame, 
         for pre, r in zip(streets["branch_prefix"], streets["branch_root_id"])
     ]
     streets["display_name"] = [
-        n if is_named(n) else (b if isinstance(b, str) else (placeholder(s) if bool(tb) else None))
-        for s, n, b, tb in zip(streets["street_id"], streets["street_name"], streets["branch_name"], streets["to_be_named"])
+        n if is_named(n) else (written_branch_name(pre, _root_text(r)) if isinstance(b, str) else (placeholder(s) if bool(tb) else None))
+        for s, n, b, tb, pre, r in zip(streets["street_id"], streets["street_name"], streets["branch_name"], streets["to_be_named"],
+                                      streets["branch_prefix"], streets["branch_root_id"])
     ]
     for col in ("street_name", "branch_name", "display_name", "to_be_named"):
         edges[col] = edges["street_id"].map(streets.set_index("street_id")[col].to_dict())
@@ -463,6 +504,7 @@ def branch_parents(
     only_drivable: bool = False,
     probe_m: float = 10.0,
     use_length_rule: bool = True,
+    own_name_max_rank: int | None = None,
 ) -> dict[int, set[int]]:
     """Which streets each street could take its derived name from.
 
@@ -477,6 +519,7 @@ def branch_parents(
         only_drivable: Only streets with a drivable edge can be derived (and named).
         probe_m: Passed to the street index.
         use_length_rule: Require the derived street to be shorter than its main street.
+        own_name_max_rank: Streets with ``street_rank`` at most this get no possible parent: they need a name of their own.
 
     Returns:
         Mapping child street id -> set of possible parent street ids (empty set when it has none).
@@ -495,6 +538,9 @@ def branch_parents(
             continue
         touching = set()
         rs = rank.get(s, 99)
+        if own_name_max_rank is not None and rs <= own_name_max_rank:
+            out[s] = touching
+            continue
         ls = own_len.get(s, 0.0)
         cands = set()
         for n in leaving[s]:

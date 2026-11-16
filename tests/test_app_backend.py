@@ -247,6 +247,7 @@ def test_addresses_and_far_houses_with_a_hand_chosen_road_point(client):
     a = client.get("/api/addresses").json()
     assert a["stats"]["no_street"] == 4 and any(w["code"] == "no_street" and w["count"] == 4 for w in a["warnings"])
     houses = {f["properties"]["building_id"]: f["properties"] for f in a["houses"]["features"]}
+    assert {"district", "survey_type", "service", "workers", "review"} <= set(houses["H0"])
     assert houses["H0"]["address"] and houses["H0"]["status"] in ("ok", "pending_name") and houses["FAR0"]["status"] == "no_street"
     # choose a road point on the first street for FAR0
     lon, lat = H.lonlat(H.X0 + 150, H.Y0 + 1)
@@ -409,7 +410,7 @@ def test_downloads_have_flags_names_and_wgs84_geometry(client):
     elm = streets[streets["street_name"] == "Elm Street"]
     assert len(elm) >= 1 and elm["osm_name"].all() and not elm["derived_name"].any() and (elm["derived_rank"] == 0).all()
     derived = streets[streets["derived_name"]]
-    assert len(derived) and derived["street_name"].str.contains("-").all() and set(derived["derived_rank"]) <= {1, 2}
+    assert len(derived) and derived["street_name"].str.startswith("Voie ").all() and set(derived["derived_rank"]) <= {1, 2}
     edges = _table(client, "edges.gpkg")
     assert edges.crs.to_epsg() == 4326 and len(edges) > len(streets) and set(edges["street_id"]) == set(streets["street_id"]) and edges["osm"].all()
     nodes = _table(client, "nodes.gpkg")
@@ -583,7 +584,13 @@ def test_roads_can_be_drawn_and_prolonged_with_snapping_and_joining_a_street(cli
     start = client.post("/api/roads/snap", json={"lat": H.lonlat(n0["x"] + 2, n0["y"] + 1)[1], "lon": H.lonlat(n0["x"] + 2, n0["y"] + 1)[0], "max_m": 12}).json()["target"]
     assert start["type"] == "node"                                                           # the first point snapped onto the node
     coords = [[start["lon"], start["lat"]], list(H.lonlat(*far))]
-    client.post("/api/roads/draw", json={"coords": coords, "start": start, "end": None, "name": "Neuve"})
+    saved = client.post("/api/roads/draw", json={"coords": coords, "start": start, "end": None, "name": "Neuve"})
+    assert saved.status_code == 200
+    immediate = saved.json()["edges"]["features"]
+    assert len(immediate) == 1
+    assert all(abs(got - wanted) <= 1e-7 for point, expected in zip(immediate[0]["geometry"]["coordinates"], coords)
+               for got, wanted in zip(point, expected))
+    assert immediate[0]["properties"]["feature"].endswith(":0")
     net = compute(client)
     new = [f["properties"] for f in net["streets"]["features"] if f["properties"]["name"] == "Neuve"]
     assert len(new) == 1
@@ -610,6 +617,30 @@ def test_health_and_the_upload_limit(client):
     h = client.get("/api/health").json()
     assert h["ok"] and h["database"] == "sqlite" and h["revision"] >= 0
     assert client.post("/api/roads/preview", content=b"x", headers={"content-length": str(70 * 1024 * 1024)}).status_code in (413, 400)
+
+
+def test_concurrent_map_requests_share_one_effective_road_replay(client, monkeypatch):
+    """Parallel map layers wait for and reuse one geometry replay after an edit."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ctx = client.app.state.ctx
+    ctx.get_effective()                                      # initialise stable node ids before counting the normal replay
+    ctx.effective = None
+    ctx.effective_hash = None
+    ctx.effective_cache.clear()
+    original = engine.effective_base
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(time.monotonic())
+        time.sleep(.05)                                      # make all four callers overlap deterministically
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "effective_base", counted)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _value: ctx.get_effective(), range(4)))
+    assert len(calls) == 1
+    assert all(result is results[0] for result in results)
 
 
 def test_kml_export_round_trips_through_the_duplicate_rule(client):
@@ -899,6 +930,25 @@ def test_rank_drivable_and_paved_are_editable_and_come_from_osm_by_default(clien
     assert client.get("/api/export/edges.csv").status_code == 200
 
 
+def test_a_street_partly_drivable_says_so_and_choosing_yes_sets_all_its_sections(client):
+    """The popup's drivable is a summary; when the sections disagree the street is marked mixed, and choosing yes sets every section."""
+    set_reference(client)
+    net = compute(client)
+    many = {}
+    for e in net["edges"]["features"]:
+        many.setdefault((e["properties"]["id"], e["properties"]["original"]), []).append(e["properties"]["ref"])
+    (sid, original), refs = next((k, r) for k, r in many.items() if len(r) > 1)
+    client.post("/api/streets/attrs", json={"original": original, "drivable": None})                   # all unknown
+    client.post("/api/edges/access", json={"refs": refs[:1], "access": "car", "revision": client.app.state.ctx.store.revision()})
+    net = compute(client)
+    street = next(f["properties"] for f in net["streets"]["features"] if f["properties"]["id"] == sid)
+    assert street["drivable"] is True and street["drivable_mixed"]                           # shown "yes" before: now "partly"
+    client.post("/api/streets/attrs", json={"original": original, "drivable": True})
+    net = compute(client)
+    assert all(e["properties"]["access"] == "car" for e in net["edges"]["features"] if e["properties"]["original"] == original)
+    assert not any(f["properties"]["drivable_mixed"] for f in net["streets"]["features"] if f["properties"]["original"] == original)
+
+
 def test_every_street_listed_at_a_node_is_drawn_on_the_map(client):
     """Streets cut off as branches get a line too (they used to be listed in the node popup but missing from the map)."""
     set_reference(client)
@@ -1099,7 +1149,7 @@ def test_ranks_set_by_the_editors_hold_for_streets_changed_by_the_community_edit
 
 
 def test_a_rank_set_for_one_part_of_a_cut_street_leaves_the_other_parts_alone(tmp_path):
-    """Street 46 of the Fotouni project is cut in three parts: the rank chosen for part 1 is only theirs."""
+    """A rank chosen for one part of a cut Fotouni street applies only to that part."""
     import shutil
     from pathlib import Path
 
@@ -1111,20 +1161,26 @@ def test_a_rank_set_for_one_part_of_a_cut_street_leaves_the_other_parts_alone(tm
     ctx = server.Context(root, None)
     server.apply_default_reference(ctx)
 
-    def ranks():
+    def computed_streets():
         proj = ctx.store.project()
         eb, rep = engine.effective_base(engine.load_base(proj), proj)
-        s = engine.compute_network(eb, proj, roads_report=rep.report if rep else None).streets
-        return {int(p): int(r) for o, p, r in zip(s["street_id_original"], s["street_part"], s["street_rank"]) if int(o) == 46}
+        return engine.compute_network(eb, proj, roads_report=rep.report if rep else None).streets
 
-    before = ranks()
-    assert len(before) >= 2
-    ctx.store.set_street_attrs({"46:1": {"rank": 0}}, "t")
-    after = ranks()
-    assert after[1] == 0 and all(after[p] == before[p] for p in before if p != 1)
-    ctx.store.set_street_attrs({"46": {"rank": 2}}, "t")                       # the whole street, the part keeps its own choice
-    whole = ranks()
-    assert whole[1] == 0 and all(whole[p] == 2 for p in whole if p != 1)
+    def ranks(streets, original):
+        return {int(p): int(r) for o, p, r in zip(streets["street_id_original"], streets["street_part"], streets["street_rank"])
+                if int(o) == original}
+
+    streets = computed_streets()
+    originals = streets.groupby("street_id_original")["street_part"].nunique()
+    original = int(originals[originals >= 2].index[0])
+    before = ranks(streets, original)
+    part = min(p for p in before if p != 0)
+    ctx.store.set_street_attrs({f"{original}:{part}": {"rank": 0}}, "t")
+    after = ranks(computed_streets(), original)
+    assert after[part] == 0 and all(after[p] == before[p] for p in before if p != part)
+    ctx.store.set_street_attrs({str(original): {"rank": 2}}, "t")              # the whole street, the part keeps its own choice
+    whole = ranks(computed_streets(), original)
+    assert whole[part] == 0 and all(whole[p] == 2 for p in whole if p != part)
 
 
 def test_branch_streets_keep_their_ids_from_one_computation_to_the_next(tmp_path):

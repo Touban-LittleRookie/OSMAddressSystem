@@ -33,6 +33,7 @@ from pyproj import Transformer
 
 from .. import branches, naming_plan, numbering, path_numbering, pipeline, street_editor, street_signs
 from ..branches import is_named, placeholder
+from . import plate as plate_mod
 from . import roads as roads_mod
 from . import street_ops
 from .project import Project
@@ -230,11 +231,72 @@ def effective_base(base: BaseData, project: Project, write_cache: bool = True) -
         ``(base, result)``: the base data to compute with and the integration result (None when the project has no drawn roads).
         Nothing is written into the base files; the edge edits that had to change are written to ``computed/``.
     """
+    if project.replay is not None:
+        nodes, edges, streets, ee, res, changed = replay_in_order(base, project)
+    else:
+        nodes, edges, streets, ee, res, changed = _replay_whole(base, project)
+    edits_path = base.edge_edits
+    if write_cache and ee is not None and changed:
+        cache = project.root / "computed"
+        cache.mkdir(exist_ok=True)
+        edits_path = cache / "edge_edits_effective.csv"
+        ee.to_csv(edits_path, index=False)
+    return BaseData(nodes, edges, streets, base.street_edits, edits_path, base.buildings, base.area, base.points), res
+
+
+def current_overlay(base: BaseData, nodes, edges, streets, res) -> None:
+    """Rebuild the drawn-road overlay of ``res`` (lines, end nodes, dangling and isolated roads) from the current network."""
+    # Replace the imported-road overlay with the current retained graph.
+    drawn = edges[edges.osmid.astype(str).str.startswith('road')]
+    drawn = drawn.loc[[u < v for u, v, _ in drawn.index]].to_crs(4326)
+    rows = [{'street_id': int(row.street_id), 'u': u, 'v': v, 'feature': str(row.osmid)[4:],
+             'name': None if pd.isna(row.get('name')) else str(row.get('name')), 'u_state': 'free', 'v_state': 'free', 'geometry': row.geometry}
+            for (u, v, _), row in drawn.iterrows()]
+    res.new_edges = gpd.GeoDataFrame(rows, geometry='geometry', crs=4326) if rows else gpd.GeoDataFrame(geometry=[], crs=4326)
+    # Integration reports describe the graph before cuts/joins. Rebuild the
+    # endpoint overlay too, otherwise deleted or moved ends remain clickable.
+    incident, drawn_nodes = {}, set()
+    for (u,v,k),row in edges.iterrows():
+        if u >= v or k >= roads_mod.SYNTHETIC_KEY: continue
+        for n in (u,v): incident.setdefault(n,[]).append(str(row.osmid))
+        if str(row.osmid).startswith('road'): drawn_nodes.update((u,v))
+    back = Transformer.from_crs(base.crs,4326,always_xy=True)
+    records=[]
+    for n in sorted(drawn_nodes):
+        osms=incident[n]; keys=sorted({s[4:] for s in osms if s.startswith('road')})
+        lon,lat=back.transform(nodes.loc[n].geometry.x,nodes.loc[n].geometry.y)
+        connected=len(osms)>1 and (len(keys)>1 or any(not s.startswith('road') for s in osms))
+        records.append({'key':f'current:{n}','node':int(n),'lon':lon,'lat':lat,'degree':len(osms),
+                        'state':'connected' if connected else 'free' if len(osms)==1 else 'inner',
+                        'to':'node','features':keys,'effective':True})
+    res.report['nodes']=records
+    res.report['dangling']=[r['key'] for r in records if r['degree']==1]
+    current_base=BaseData(nodes,edges,streets,base.street_edits,base.edge_edits,base.buildings,base.area,base.points)
+    res.report['isolated']=sorted({str(edges.loc[i].osmid)[4:] for part in disconnected_parts(current_base)
+                                   for i in part['edges'] if str(edges.loc[i].osmid).startswith('road')})
+    tr = Transformer.from_crs(4326, base.crs, always_xy=True)
+    res.report['uncertain_ends'] = [end for end in res.report.get('uncertain_ends', [])
+        if any(str(row.osmid) == 'road'+end['key'] and row.geometry.distance(shapely.geometry.Point(*tr.transform(end['lon'], end['lat']))) < 1
+               for _, row in edges.iterrows())]
+
+
+def _replay_whole(base: BaseData, project: Project):
+    """Replay the folded road edits of ``project.roads`` all together (drawn roads first, then cuts and connections).
+
+    This is how every edit was replayed before the edits were applied in order; it still rebuilds the frozen part of the
+    history (see :func:`replay_in_order`).
+
+    Returns:
+        ``(nodes, edges, streets, edge edits, result, changed)``.
+    """
     rd = project.roads
     removed_feats = set(rd.get("removed_features", []))
     imports = rd.get("imports", [])
+    import_events = {int(imp['id']): int(imp['_event_id']) for imp in imports if imp.get('_event_id') is not None}
     nodes, edges, streets = base.nodes, base.edges, base.streets
-    edges = roads_mod.reshape_edges(edges, rd.get("geometry", {}))
+    nodes, edges, moved_from = roads_mod.apply_node_moves(nodes, edges, rd.get("node_moves"))   # a reshape across sections
+    edges = roads_mod.reshape_edges(edges, rd.get("geometry", {}), moved_from)
+    nodes = roads_mod.move_dead_end_nodes(nodes, edges)                                  # a reshaped dead end takes its node along
     if rd.get("removed"):
         edges, streets = roads_mod.drop_edges(edges, streets, rd["removed"])
     features = [{**f, "key": f"{imp['id']}:{f['id']}"} for imp in imports for f in imp["features"] if f"{imp['id']}:{f['id']}" not in removed_feats]
@@ -249,15 +311,29 @@ def effective_base(base: BaseData, project: Project, write_cache: bool = True) -
             edits.loc[mask, "coords"] = ""
         return edits
     ee = prefer_current_shapes(ee)
+    legacy = project.node_ids is None                  # before the drawn-road node ids became stable: replay exactly as then
+    cuts, consumed, cut_away = rd.get('cuts', []), set(), []
+    if cuts and not legacy:
+        # A portion deleted from a road that was there before is deleted first: a road drawn afterwards to replace it then
+        # connects to the cut ends instead of splitting the old road (which would lose the cut and bring the portion back).
+        deferred = []
+        early, late = roads_mod.cuts_before_drawn_roads(cuts, rd.get('joins', []))
+        nodes, edges, streets, ee, _ = roads_mod.cut_sections(nodes, edges, streets, early, ee, rd.get('removed', ()), rd.get('geometry'),
+                                                              defer=deferred, consumed=consumed, cut_away=cut_away)
+        cuts = sorted(deferred + late, key=lambda op: op['order'])
+        if rd.get("removed"):
+            edges, streets = roads_mod.drop_edges(edges, streets, rd["removed"])
     res = None
     if features:
-        res = roads_mod.integrate_roads(nodes, edges, streets, ee, features, rd.get("connections", {}), keep=set(rd.get("keep", [])))
+        res = roads_mod.integrate_roads(nodes, edges, streets, ee, features, rd.get("connections", {}), keep=set(rd.get("keep", [])),
+                                        node_ids=project.node_ids, node_moves=rd.get("node_moves"))
         nodes, edges, streets = res.nodes, res.edges, res.streets
         if res.edge_edits is not None:
             ee = res.edge_edits
     ee = prefer_current_shapes(ee)
     assign = rd.get("edge_street") or {}
-    edges = roads_mod.reshape_edges(edges, rd.get("geometry", {}))
+    edges = roads_mod.reshape_edges(edges, rd.get("geometry", {}), moved_from)
+    nodes = roads_mod.move_dead_end_nodes(nodes, edges)
     if res is not None and rd.get("geometry"):
         # Keep the Edit streets overlay consistent with the corrected graph.
         wgs = edges.to_crs(4326)
@@ -272,8 +348,11 @@ def effective_base(base: BaseData, project: Project, write_cache: bool = True) -
         if ee is not None and len(ee):                       # the community edge edits must not undo the choice made here
             ee = ee[[roads_mod.edge_ref(u, v, k) not in assign for u, v, k in zip(ee["u"].astype(int), ee["v"].astype(int), ee["key"].astype(int))]]
     if rd.get('cuts') or rd.get('joins'):
-        nodes, edges, streets, ee, stale = roads_mod.cut_sections(nodes, edges, streets, rd.get('cuts', []), ee, rd.get('removed', ()), rd.get('geometry'), rd.get('joins', []))
+        nodes, edges, streets, ee, stale = roads_mod.cut_sections(nodes, edges, streets, cuts, ee, rd.get('removed', ()), rd.get('geometry'), rd.get('joins', []),
+                                                                  consumed=consumed, cut_away=cut_away, import_events=import_events,
+                                                                  drawn_features=features)
         edges = roads_mod.reshape_edges(edges, rd.get('geometry', {}))
+        nodes = roads_mod.move_dead_end_nodes(nodes, edges)
         if rd.get('removed'):
             edges, streets = roads_mod.drop_edges(edges, streets, rd['removed'])
         if res is None:
@@ -287,47 +366,215 @@ def effective_base(base: BaseData, project: Project, write_cache: bool = True) -
         if ee is not None and len(ee):
             ee = ee[[roads_mod.edge_ref(u,v,k) not in assign for u,v,k in zip(ee.u.astype(int),ee.v.astype(int),ee.key.astype(int))]]
     if res is not None and (rd.get('cuts') or rd.get('joins') or rd.get('removed')):
-        # Replace the imported-road overlay with the current retained graph.
-        drawn = edges[edges.osmid.astype(str).str.startswith('road')]
-        drawn = drawn.loc[[u < v for u, v, _ in drawn.index]].to_crs(4326)
-        rows = [{'street_id': int(row.street_id), 'u': u, 'v': v, 'feature': str(row.osmid)[4:],
-                 'name': None if pd.isna(row.get('name')) else str(row.get('name')), 'u_state': 'free', 'v_state': 'free', 'geometry': row.geometry}
-                for (u, v, _), row in drawn.iterrows()]
-        res.new_edges = gpd.GeoDataFrame(rows, geometry='geometry', crs=4326) if rows else gpd.GeoDataFrame(geometry=[], crs=4326)
-        # Integration reports describe the graph before cuts/joins. Rebuild the
-        # endpoint overlay too, otherwise deleted or moved ends remain clickable.
-        incident, drawn_nodes = {}, set()
-        for (u,v,k),row in edges.iterrows():
-            if u >= v or k >= roads_mod.SYNTHETIC_KEY: continue
-            for n in (u,v): incident.setdefault(n,[]).append(str(row.osmid))
-            if str(row.osmid).startswith('road'): drawn_nodes.update((u,v))
-        back = Transformer.from_crs(base.crs,4326,always_xy=True)
-        records=[]
-        for n in sorted(drawn_nodes):
-            osms=incident[n]; keys=sorted({s[4:] for s in osms if s.startswith('road')})
-            lon,lat=back.transform(nodes.loc[n].geometry.x,nodes.loc[n].geometry.y)
-            connected=len(osms)>1 and (len(keys)>1 or any(not s.startswith('road') for s in osms))
-            records.append({'key':f'current:{n}','node':int(n),'lon':lon,'lat':lat,'degree':len(osms),
-                            'state':'connected' if connected else 'free' if len(osms)==1 else 'inner',
-                            'to':'node','features':keys,'effective':True})
-        res.report['nodes']=records
-        res.report['dangling']=[r['key'] for r in records if r['degree']==1]
-        current_base=BaseData(nodes,edges,streets,base.street_edits,base.edge_edits,base.buildings,base.area,base.points)
-        res.report['isolated']=sorted({str(edges.loc[i].osmid)[4:] for part in disconnected_parts(current_base)
-                                       for i in part['edges'] if str(edges.loc[i].osmid).startswith('road')})
-        tr = Transformer.from_crs(4326, base.crs, always_xy=True)
-        res.report['uncertain_ends'] = [end for end in res.report.get('uncertain_ends', [])
-            if any(str(row.osmid) == 'road'+end['key'] and row.geometry.distance(shapely.geometry.Point(*tr.transform(end['lon'], end['lat']))) < 1
-                   for _, row in edges.iterrows())]
+        current_overlay(base, nodes, edges, streets, res)
     edges, streets = apply_attributes(edges, streets, {})             # the rank / drivable / paved of the editors are applied in compute_network, to the ids they were given for
+    edges = apply_edge_access(edges, rd.get("edge_access"))
     changed = bool(assign) or bool(rd.get("geometry")) or bool(rd.get('cuts')) or bool(rd.get('joins')) or bool(res is not None and res.report["split_edges"])
-    edits_path = base.edge_edits
-    if write_cache and ee is not None and changed:
-        cache = project.root / "computed"
-        cache.mkdir(exist_ok=True)
-        edits_path = cache / "edge_edits_effective.csv"
-        ee.to_csv(edits_path, index=False)
-    return BaseData(nodes, edges, streets, base.street_edits, edits_path, base.buildings, base.area, base.points), res
+    return nodes, edges, streets, ee, res, changed
+
+_REPLAY_CACHE: dict = {}
+"""``(project folder, frozen key) -> {"frozen": parts, "steps": [(signature, state)]}``: the frozen network and some of
+the states after the later edits, so that a new edit only applies itself."""
+
+_KEEP_EVERY = 10
+"""Besides the latest one, the state after every 10th later edit is kept (an undo restarts from the nearest one)."""
+
+
+def _files_stamp(root: Path) -> list:
+    """Size and modification time of the files the base network is read from (a rebuilt network is another frozen part)."""
+    files = sorted((root / "network").glob("*")) + [root / "input" / "edge_edits.csv", root / "input" / "streets.osm"]
+    return [(p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in files if p.is_file()]
+
+
+def _frozen_part(base: BaseData, project: Project) -> tuple[str, tuple]:
+    """The network after the frozen part of the history (see ``Store._replay_plan``), replayed once and kept on disk.
+
+    It is data, not a cache: it is what the editors saw when the later edits were made, so it is never rebuilt because the
+    code changed; only a change of the frozen edits (an undo, a restore) or of the base network rebuilds it.
+
+    Returns:
+        ``(key, (nodes, edges, streets, edge edits, result, changed))``.
+    """
+    import hashlib
+    import json
+    import pickle
+    frozen = dataclasses.replace(project, roads=project.replay["base_roads"], replay=None)
+    key = hashlib.sha1(json.dumps({"roads": frozen.roads_hash(), "node_ids": project.node_ids, "files": _files_stamp(project.root)},
+                                  sort_keys=True, default=str).encode()).hexdigest()[:16]
+    cached = _REPLAY_CACHE.get((str(project.root), key))
+    if cached is not None:
+        return key, cached["frozen"]
+    path = project.root / "computed" / "replay" / f"frozen-{key}.pkl"
+    parts = None
+    if path.is_file():
+        try:
+            parts = pickle.loads(path.read_bytes())
+        except Exception:                                   # an unreadable file is replayed again
+            parts = None
+    if parts is None:
+        parts = _replay_whole(base, frozen)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(pickle.dumps(parts))
+        tmp.replace(path)
+    _REPLAY_CACHE[(str(project.root), key)] = {"frozen": parts, "steps": []}
+    return key, parts
+
+
+def _copy_state(st: dict) -> dict:
+    """An independent copy of a replay state (the tables are copied, the lists of records are shared read-only)."""
+    return {k: (list(v) if isinstance(v, list) else v.copy() if hasattr(v, "copy") and not isinstance(v, dict) else v)
+            for k, v in st.items()}
+
+
+def _section(edges, ref: str):
+    """The ``(u, v, key)`` of the section with reference ``ref`` (u < v), or None."""
+    return next((i for i in edges.index if i[0] < i[1] and roads_mod.edge_ref(*i) == ref), None)
+
+
+def _apply_network_edit(st: dict, op: dict, project: Project) -> None:
+    """Apply one later network edit to the replay state ``st`` (in place), on the network it was made on.
+
+    An edit that cannot be applied is recorded in ``st["lost"]`` (never silently left out).
+    """
+    act, new = op["action"], op["new"]
+    nodes, edges, streets, ee = st["nodes"], st["edges"], st["streets"], st["ee"]
+
+    def lose(ref, reason):
+        st["lost"].append({"event": op["id"], "action": act, "ref": ref, "reason": reason})
+
+    if act == "roads_import":
+        removed = set(project.roads.get("removed_features", []))
+        feats = [{**f, "key": f"{new['id']}:{f['id']}"} for f in new["features"] if f"{new['id']}:{f['id']}" not in removed]
+        if not feats:
+            return
+        used = set(edges.index.get_level_values(0)) | set(edges.index.get_level_values(1))
+        res = roads_mod.integrate_roads(nodes[nodes.index.isin(used)], edges, streets, ee, feats, new.get("connections") or {},
+                                        keep=set(new.get("keep") or []), node_ids=project.node_ids or {}, first_street_id=st["next_sid"])
+        nodes, edges, streets = res.nodes, res.edges, res.streets
+        if res.edge_edits is not None:
+            ee = res.edge_edits
+        st["next_sid"] = max(st["next_sid"], int(pd.to_numeric(streets["street_id"]).max()) + 1)
+        st["replaced"] += res.report.get("replaced", [])
+        st["uncertain"] += res.report.get("uncertain_ends", [])
+        st["import_nodes"] = (op["id"], [f["key"] for f in feats], res.report.get("nodes", []))
+        counts = dict(st.get("counts") or {})
+        for name in ("features", "pieces", "split_edges", "auto_connected", "geometry_edits_lost"):
+            counts[name] = counts.get(name, 0) + int(res.report.get(name, 0) or 0)
+        counts["street_ids"] = {**counts.get("street_ids", {}), **res.report.get("street_ids", {})}
+        st["counts"] = counts
+        for n in res.report.get("nodes", []):
+            if n.get("error"):
+                lose("road" + ",".join(n.get("features", [])), n["error"])
+    elif act == "road_cut":
+        nodes, edges, streets, ee, stale = roads_mod.cut_sections(nodes, edges, streets, [dict(new)], ee)
+        for ref in stale:
+            lose(ref, "the section of this deleted portion is not there")
+    elif act == "road_join":
+        nodes, edges, streets, ee, stale = roads_mod.cut_sections(nodes, edges, streets, [], ee, joins=[{**new, "order": 0}])
+        for ref in stale:
+            lose(ref, "this connection no longer fits")
+    elif act in ("road_geometry", "road_stretch"):
+        shapes = {new["ref"]: new["coords"]} if act == "road_geometry" else dict(new["geometry"])
+        moved_from = {}
+        if act == "road_stretch" and new.get("nodes"):
+            nodes, edges, moved_from = roads_mod.apply_node_moves(nodes, edges, new["nodes"])
+        before = {ref: _section(edges, ref) for ref in shapes}
+        old = {ref: edges.loc[i].geometry for ref, i in before.items() if i is not None}
+        edges = roads_mod.reshape_edges(edges, shapes, moved_from)
+        nodes = roads_mod.move_dead_end_nodes(nodes, edges)
+        if ee is not None and "coords" in ee and len(ee):
+            # The street decision of an old community edge edit stays, its older shape must not overwrite the new one.
+            ee = ee.copy()
+            ee.loc[[roads_mod.edge_ref(u, v, k) in shapes for u, v, k in zip(ee["u"].astype(int), ee["v"].astype(int), ee["key"].astype(int))], "coords"] = ""
+        tr = Transformer.from_crs(4326, edges.crs, always_xy=True)
+        for ref, coords in shapes.items():
+            if before[ref] is None:
+                lose(ref, "the section of this reshape is not there")
+                continue
+            wanted = shapely.geometry.LineString([tr.transform(*p) for p in coords])
+            if edges.loc[before[ref]].geometry.equals(old[ref]) and wanted.hausdorff_distance(old[ref]) > 0.05:
+                lose(ref, "the ends of this reshape no longer meet the section")
+    elif act == "edges_remove":
+        refs = set(new.get("edges", []))
+        drawn = {f"road{key}" for key in new.get("features", [])}
+        refs |= {roads_mod.edge_ref(*i) for i, osmid in zip(edges.index, edges["osmid"].astype(str)) if osmid in drawn}
+        present = {roads_mod.edge_ref(*i) for i in edges.index}
+        for ref in sorted(set(new.get("edges", [])) - present):
+            lose(ref, "the deleted section is not there")
+        edges, streets = roads_mod.drop_edges(edges, streets, refs)
+    elif act == "edges_assign":
+        mapping = {str(k): int(v) for k, v in new.get("edges", {}).items()}
+        edges, streets = roads_mod.assign_street_ids(edges, streets, mapping)
+        if ee is not None and len(ee):
+            ee = ee[[roads_mod.edge_ref(u, v, k) not in mapping for u, v, k in zip(ee["u"].astype(int), ee["v"].astype(int), ee["key"].astype(int))]]
+    st.update(nodes=nodes, edges=edges, streets=streets, ee=ee)
+
+
+def replay_in_order(base: BaseData, project: Project):
+    """The network with the road edits: the frozen part of the history, then each later edit in the order it was made.
+
+    Every edit names the network it was made on (a section ``u-v-key``, a node, a road point). Applying them one after the
+    other on top of the edits before them gives each one exactly that network, so a new road can no longer make an older
+    reshape or deletion stop applying. Only the new edits are applied after an edit (the states are kept, see
+    :data:`_REPLAY_CACHE`); an edit that still cannot be applied is reported in ``report["lost_edits"]``.
+
+    Returns:
+        ``(nodes, edges, streets, edge edits, result, changed)`` as :func:`_replay_whole`.
+    """
+    import copy as copy_mod
+    import hashlib
+    import json
+    key, (nodes, edges, streets, ee, res0, changed) = _frozen_part(base, project)
+    entry = _REPLAY_CACHE[(str(project.root), key)]
+    ops = project.replay["ops"]
+    signatures, sig = [], key
+    for op in ops:
+        sig = hashlib.sha1((sig + json.dumps(op, sort_keys=True)).encode()).hexdigest()
+        signatures.append(sig)
+    known = dict(entry["steps"])
+    start = next((i for i in range(len(ops), 0, -1) if signatures[i - 1] in known), 0)
+    if start:
+        st = _copy_state(known[signatures[start - 1]])
+    else:
+        top = [int(pd.to_numeric(streets["street_id"]).max())]
+        if ee is not None and len(ee) and "new_street_id" in ee:
+            top.append(int(pd.to_numeric(ee["new_street_id"], errors="coerce").max() or 0))
+        st = {"nodes": nodes, "edges": edges, "streets": streets, "ee": ee, "lost": [], "replaced": [], "uncertain": [],
+              "next_sid": max(top) + 1}
+    position = {s: i for i, s in enumerate(signatures)}
+    steps = [(s, state) for s, state in entry["steps"] if position.get(s, len(ops)) < start]
+    for i in range(start, len(ops)):
+        _apply_network_edit(st, ops[i], project)
+        if i == len(ops) - 1 or (i + 1) % _KEEP_EVERY == 0:
+            steps.append((signatures[i], _copy_state(st)))
+    if all(op["id"] for op in ops):                   # a preview (an edit not saved, id 0) is not kept
+        entry["steps"] = [(s, state) for s, state in steps if s == signatures[-1] or (position[s] + 1) % _KEEP_EVERY == 0] if ops else []
+    nodes, edges, streets, ee = st["nodes"], st["edges"], st["streets"], st["ee"]
+    edges, streets = apply_attributes(edges, streets, {})
+    edges = apply_edge_access(edges, project.roads.get("edge_access"))
+    if res0 is None:
+        report = {"features": 0, "pieces": 0, "nodes": [], "dangling": [], "isolated": [], "street_ids": {}, "split_edges": 0,
+                  "auto_connected": 0, "replaced": [], "node_ids": {}}
+    else:
+        report = copy_mod.deepcopy(res0.report)
+    report["stale_cuts"] = list(report.get("stale_cuts", [])) + [lost["ref"] for lost in st["lost"]]
+    report["lost_edits"] = list(st["lost"])
+    for name, value in (st.get("counts") or {}).items():
+        report[name] = {**report.get(name, {}), **value} if isinstance(value, dict) else int(report.get(name, 0) or 0) + value
+    report["replaced"] = list(report.get("replaced", [])) + st["replaced"]
+    report["uncertain_ends"] = list(report.get("uncertain_ends", [])) + st["uncertain"]
+    res = roads_mod.RoadsResult(nodes, edges, streets, ee, report, gpd.GeoDataFrame(geometry=[], crs=4326))
+    current_overlay(base, nodes, edges, streets, res)
+    last = st.get("import_nodes")
+    if ops and ops[-1]["action"] == "roads_import" and last and last[0] == ops[-1]["id"]:
+        # The ends of the road just drawn or previewed keep the keys and suggestions of their integration, so that the
+        # connections chosen for them (by node key) apply.
+        mine = set(last[1])
+        records = [r for r in res.report["nodes"] if not set(r["features"]) <= mine] + list(last[2])
+        res.report["nodes"] = records
+        res.report["dangling"] = [r["key"] for r in records if r["state"] in ("free", "pending_edge") and r["degree"] == 1]
+    return nodes, edges, streets, ee, res, bool(changed or ops)
 
 
 def roads_warnings(report: dict, streets: pd.DataFrame) -> list[dict]:
@@ -354,13 +601,18 @@ def roads_warnings(report: dict, streets: pd.DataFrame) -> list[dict]:
         ends = report['uncertain_ends']
         out.append(_warning('path_uncertain', 'warning', f'{len(ends)} traced path ends need review',
                             'Tracing was stopped where the path was unclear. Do not assume a connection beyond these endpoints.', count=len(ends), nodes=ends))
-    dang = [n for n in report["nodes"] if n["key"] in set(report["dangling"])]
+    if report.get('uncertain_sections'):
+        sections = report['uncertain_sections']
+        out.append(_warning('road_sections_uncertain', 'warning', f'{len(sections)} road portions need field review',
+                            'These intervals were marked unclear in the imagery. Verify them before treating their geometry as confirmed.',
+                            count=len(sections)))
+    dang = [n for n in report.get("nodes", []) if n["key"] in set(report.get("dangling", []))]
     if dang:
         keys = sorted({f for n in dang for f in n.get("features", [])})
         out.append(_warning("roads_dangling", "warning", f"{len(dang)} ends of the drawn roads are not connected",
                             "Click an end, then the road or node to connect it to. An unconnected end is a dead end.", ids_of(keys), count=len(dang),
                             nodes=[{"key": n["key"], "lat": n["lat"], "lon": n["lon"]} for n in dang]))
-    if report["isolated"]:
+    if report.get("isolated"):
         out.append(_warning("roads_isolated", "error", f"{len(report['isolated'])} drawn roads do not reach the street network",
                             "They get no number and no name until they are connected.", ids_of(report["isolated"]), count=len(report["isolated"])))
     return out
@@ -539,8 +791,13 @@ def add_flag_columns(edges: gpd.GeoDataFrame, osm_path) -> gpd.GeoDataFrame:
                                   for o in edges["osmid"].astype(str)], dtype="boolean")
     if "drivable_info" not in edges.columns:
         known = set(DEFAULT_HIGHWAY_RANKS) | set(DEFAULT_NON_DRIVABLE_HIGHWAYS)
-        edges["drivable_info"] = pd.array([bool(d) if any(t in known for t in re.findall(r"[a-z_]+", str(h))) else None
-                                          for d, h in zip(edges["is_drivable"], edges["highway"])], dtype="boolean")
+        def drivable(d, h):
+            tags = re.findall(r"[a-z_]+", str(h))
+            if not any(t in known for t in tags):
+                return None
+            # Networks built before tracks were made drivable (5 November) stored tracks as not drivable.
+            return bool(d) or ("track" in tags and not any(t in DEFAULT_NON_DRIVABLE_HIGHWAYS for t in tags))
+        edges["drivable_info"] = pd.array([drivable(d, h) for d, h in zip(edges["is_drivable"], edges["highway"])], dtype="boolean")
     return edges
 
 
@@ -600,8 +857,34 @@ def apply_attributes(edges: gpd.GeoDataFrame, streets: pd.DataFrame, attrs: dict
         if "paved" in a:
             edges.loc[m, "paved"] = pd.array([a["paved"]] * int(m.sum()), dtype="boolean")
     rank = [path_numbering.highway_rank(h) for h in edges["highway"]]
-    edges["is_drivable"] = [bool(d) if pd.notna(d) else r < 5 for d, r in zip(edges["drivable_info"], rank)]       # unknown: by the rank
+    edges["is_drivable"] = [r < 5 and (bool(d) if pd.notna(d) else True) for d, r in zip(edges["drivable_info"], rank)]       # unknown: by the rank; rank 5 never
     return edges, dominant_rank(edges, streets)                                  # one rank per street: the one with the most length
+
+
+def apply_edge_access(edges: gpd.GeoDataFrame, overrides: dict | None) -> gpd.GeoDataFrame:
+    """Apply access classes keyed by stable edge reference and derive the binary routing flag.
+
+    Legacy nullable ``drivable_info`` values become car / foot / unknown. Explicit per-edge
+    overrides win. Only car is drivable (motorcycle and foot are not); unknown retains the historical rank rule;
+    rank 5 is always excluded.
+    """
+    edges = edges.copy()
+    legacy = edges["drivable_info"] if "drivable_info" in edges else pd.Series([None] * len(edges), index=edges.index)
+    edges["access"] = ["car" if pd.notna(value) and bool(value) else "foot" if pd.notna(value) else None for value in legacy]
+    configured = overrides or {}
+    if configured:
+        def chosen(ref: str, lineage, value):                   # the piece's own choice, else that of the road it was split or cut from
+            for r in [ref] + (lineage.split("|") if isinstance(lineage, str) and lineage else []):
+                if r in configured:
+                    return configured[r]
+            return value
+        lineages = edges["ref_lineage"] if "ref_lineage" in edges else [None] * len(edges)
+        edges["access"] = [chosen(roads_mod.edge_ref(u, v, k), lin, value)
+                           for (u, v, k), lin, value in zip(edges.index, lineages, edges["access"])]
+    rank = [path_numbering.highway_rank(h) for h in edges["highway"]]
+    edges["is_drivable"] = [False if r >= 5 else (True if pd.isna(value) else value == "car")
+                            for value, r in zip(edges["access"], rank)]          # pandas keeps an unknown access as NaN, not None
+    return edges
 
 
 def apply_part_attributes(edges: gpd.GeoDataFrame, streets: pd.DataFrame, part_attrs: dict) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
@@ -634,7 +917,7 @@ def apply_part_attributes(edges: gpd.GeoDataFrame, streets: pd.DataFrame, part_a
         if "paved" in a:
             edges.loc[m, "paved"] = pd.array([a["paved"]] * int(m.sum()), dtype="boolean")
     rank = [path_numbering.highway_rank(h) for h in edges["highway"]]
-    edges["is_drivable"] = [bool(d) if pd.notna(d) else r < 5 for d, r in zip(edges["drivable_info"], rank)]
+    edges["is_drivable"] = [r < 5 and (bool(d) if pd.notna(d) else True) for d, r in zip(edges["drivable_info"], rank)]
     return edges, dominant_rank(edges, streets)
 
 
@@ -699,7 +982,7 @@ def _redundant_planned(nodes1, edges2, streets2, chosen: set, order: dict, st, a
     Returns:
         The original ids that can be dropped.
     """
-    parents = branches.branch_parents(nodes1, edges2, streets2)
+    parents = branches.branch_parents(nodes1, edges2, streets2, own_name_max_rank=st.own_name_max_rank)
     children = naming_plan._children(parents)
     deep_ok = branches.second_level_streets(nodes1, edges2, streets2, st.second_level_max_drive_m)
     adjacent, _nodes = branches.street_adjacency(nodes1, edges2, streets2)
@@ -738,6 +1021,107 @@ def _redundant_planned(nodes1, edges2, streets2, chosen: set, order: dict, st, a
         keep = trial
         drop.add(o)
     return drop
+
+
+@dataclass
+class _OriginalNamingPlan:
+    """Minimum naming tasks on the final cut graph, grouped by original street id."""
+
+    chosen: list[int]
+    method: str
+    optimal: bool
+    uncovered: list[int]
+    notes: list[str] = field(default_factory=list)
+    reasons: dict[int, str] = field(default_factory=dict)
+
+
+def _minimum_original_plan(nodes, edges, streets, st, aoi) -> _OriginalNamingPlan:
+    """Plan final naming tasks with all cut parts of one original street costing one community name.
+
+    The generic planner works on the current street ids. After path numbering, one original street can have several
+    part ids, but the community still performs one naming task for that original street. This grouped solve is the
+    R3 optimisation step: it runs on the final cut graph and minimises original ids rather than individual parts.
+    """
+    parents = branches.branch_parents(nodes, edges, streets, own_name_max_rank=st.own_name_max_rank)
+    children = naming_plan._children(parents)
+    deep_ok = branches.second_level_streets(nodes, edges, streets, st.second_level_max_drive_m)
+    ids = streets["street_id"].astype(int)
+    original = dict(zip(ids, streets["street_id_original"].astype(int)))
+    own = {int(s) for s, name in zip(ids, streets["street_name"]) if is_named(name)}
+    inside = _street_ids_inside(edges, aoi) if aoi is not None else set(parents)
+    targets = set(parents) & inside
+    existing = set(naming_plan._reach(children, own, st.max_levels, deep_ok))
+    remaining = targets - existing
+
+    parts: dict[int, set[int]] = {}
+    for sid, oid in original.items():
+        if sid in parents and sid not in own:
+            parts.setdefault(oid, set()).add(sid)
+    cover = {oid: (set(naming_plan._reach(children, roots, st.max_levels, deep_ok)) & remaining)
+             for oid, roots in parts.items()}
+    uncovered = sorted(t for t in remaining if not any(t in got for got in cover.values()))
+    solvable = remaining - set(uncovered)
+    useful = [oid for oid in sorted(parts) if cover[oid] & solvable]
+
+    grouped = streets.assign(_original=streets["street_id_original"].astype(int)).groupby("_original")
+    rank = grouped["street_rank"].min().to_dict()
+    length = grouped["length_m"].sum().to_dict()
+    cost = {oid: 1.0 + 1e-9 * oid for oid in parts}
+    tie = {oid: (-float(rank.get(oid, 4)), float(length.get(oid, 0) or 0)) for oid in parts}
+    notes: list[str] = []
+    picked = None
+    used = "greedy"
+    optimal = False
+    if solvable and st.plan_method in ("auto", "exact"):
+        picked, proven = naming_plan._solve_exact(useful, cover, solvable, cost, st.time_limit_s)
+        if picked is not None:
+            used, optimal = "exact", proven
+            if not proven:
+                notes.append("the final-cut exact solver stopped at its time limit")
+        elif st.plan_method == "exact":
+            notes.append("the final-cut exact solver failed; using the greedy grouped plan")
+    elif not solvable:
+        picked, used, optimal = [], "exact", True
+    if picked is None:
+        picked = naming_plan._solve_greedy(useful, cover, solvable, tie) if solvable else []
+
+    left = set(solvable)
+    pool = list(picked)
+    order: list[int] = []
+    reasons: dict[int, str] = {}
+    while pool:
+        oid = max(pool, key=lambda x: (len(cover.get(x, set()) & left), -float(rank.get(x, 4)),
+                                       float(length.get(x, 0) or 0), -x))
+        gain = len(cover.get(oid, set()) & left)
+        order.append(oid)
+        reasons[oid] = "coverage" if gain else "connection"
+        left -= cover.get(oid, set())
+        pool.remove(oid)
+    return _OriginalNamingPlan(order, used, optimal and not uncovered, uncovered, notes, reasons)
+
+
+def _additional_original_plan(nodes, edges, streets, chosen: set[int], st, aoi, ref_node):
+    """Find coverage or connection tasks still needed after validating a grouped final-cut plan."""
+    tmp = streets.copy()
+    tmp["street_name"] = [name if is_named(name) else (placeholder(int(sid)) if int(oid) in chosen else None)
+                          for sid, oid, name in zip(tmp["street_id"], tmp["street_id_original"], tmp["street_name"])]
+    inside = _street_ids_inside(edges, aoi) if aoi is not None else None
+    plan = naming_plan.plan_minimal_naming(
+        nodes, edges, tmp, max_levels=st.max_levels, targets=None if inside is None else sorted(inside),
+        method=st.plan_method, time_limit_s=st.time_limit_s,
+        reference_node=ref_node if st.connect_backbone else None,
+        second_level_max_drive_m=st.second_level_max_drive_m, own_name_max_rank=st.own_name_max_rank)
+    original = tmp.set_index("street_id")["street_id_original"].astype(int).to_dict()
+    additions: list[int] = []
+    reasons: dict[int, str] = {}
+    for sid, reason in zip(plan.chosen["street_id"], plan.chosen["reason"]):
+        oid = int(original[int(sid)])
+        if oid not in chosen and oid not in additions:
+            additions.append(oid)
+        if reason == "connection" or oid not in reasons:
+            reasons[oid] = str(reason)
+    unconnectable = sorted({int(original[int(s)]) for s in plan.unconnectable if int(s) in original})
+    return additions, reasons, plan, unconnectable
 
 
 def restrict_to_aoi(base: BaseData, ref_node: int) -> BaseData:
@@ -1020,6 +1404,9 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
         tmp, _ = apply_attributes(tmp, base.streets, attrs)
         tmp["street_id"] = base.edges["street_id"]
         base = dataclasses.replace(base, edges=tmp)
+    edge_access = project.roads.get("edge_access") or {}
+    edges0 = apply_edge_access(edges0, edge_access)
+    base = dataclasses.replace(base, edges=apply_edge_access(base.edges, edge_access))
     named_ways = osm_named_ways(project.input_dir / "streets.osm")
     protected = {int(k) for k in project.names}
     if base.street_edits and Path(str(base.street_edits)).exists():
@@ -1039,7 +1426,11 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
     inside0 = _street_ids_inside(edges0, aoi) if aoi is not None else None             # only the streets of the area of interest need names
     plan = naming_plan.plan_minimal_naming(
         nodes0, edges0, streets0, max_levels=st.max_levels, targets=None if inside0 is None else sorted(inside0), method=st.plan_method, time_limit_s=st.time_limit_s,
-        reference_node=ref_node if st.connect_backbone else None, second_level_max_drive_m=st.second_level_max_drive_m)
+        reference_node=ref_node if st.connect_backbone else None, second_level_max_drive_m=st.second_level_max_drive_m,
+        own_name_max_rank=st.own_name_max_rank)
+    initial_plan_count = int(len(plan.chosen))
+    initial_plan_method = plan.method
+    initial_plan_optimal = plan.optimal
     planned = {int(s) for s in plan.chosen["street_id"]}
     first_order = {int(s): int(o) for s, o in zip(plan.chosen["street_id"], plan.chosen["order"])}
     reasons = {int(s): r for s, r in zip(plan.chosen["street_id"], plan.chosen["reason"])}
@@ -1056,14 +1447,18 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
             backbone_streets=backbone, **common)
         edges1, streets1 = drop_inferred_part_names(edges1, streets1, named_ways, protected)
         edges1, streets1 = apply_part_attributes(edges1, streets1, part_attrs)          # what the editors chose for one part of a cut street
+        edges1 = apply_edge_access(edges1, edge_access)
         streets1 = dominant_rank(edges1, streets1)                                     # the cut parts get the rank that has most of their length
         streets1 = _overlay_names(streets1, assigned, first_part_only=True)
         orig = streets1["street_id_original"].astype(int)
         part = streets1["street_part"].astype(int)
         own = streets1["street_name"].map(is_named)
-        planned_parts = streets1.loc[orig.isin(planned_ | extra_) & ~own & (part == 0), "street_id"]
+        # One community naming task is attached to the original street. Every cut part is therefore a planned root;
+        # charging the later parts as separate tasks made the post-cut result larger than the true original-id plan.
+        planned_parts = streets1.loc[orig.isin(planned_ | extra_) & ~own, "street_id"]
         say("deriving the sub-street names")
-        kw = dict(number_divisor_m=st.branch_step_m, max_levels=st.max_levels, second_level_max_drive_m=st.second_level_max_drive_m)
+        kw = dict(number_divisor_m=st.branch_step_m, max_levels=st.max_levels, second_level_max_drive_m=st.second_level_max_drive_m,
+                  own_name_max_rank=st.own_name_max_rank)
         edges2, streets2 = branches.assign_branch_names(nodes1, edges1, streets1, planned_streets=planned_parts, **kw)
         # the other parts of a street to name (or named by the app) derive their names from the street they branch from; those that cannot
         # take the name of their street (``(B)``) or are to be named with it
@@ -1091,7 +1486,7 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
                               for s, n, tb in zip(tmp["street_id"], tmp["street_name"], tmp["to_be_named"])]
         p2 = naming_plan.plan_minimal_naming(nodes1, edges2, tmp, max_levels=st.max_levels, targets=unnamed, method=st.plan_method,
                                              time_limit_s=st.time_limit_s, reference_node=ref_node if st.connect_backbone else None,
-                                             second_level_max_drive_m=st.second_level_max_drive_m)
+                                             second_level_max_drive_m=st.second_level_max_drive_m, own_name_max_rank=st.own_name_max_rank)
         by_id = streets2.set_index("street_id")["street_id_original"]
         new = {int(by_id[int(s)]) for s in p2.chosen["street_id"]} - planned - extra
         if not new:                                        # nothing can give them a name: they simply need a name of their own
@@ -1113,6 +1508,59 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
             if not trial[5]:
                 planned, extra = planned - drop, extra - drop
                 nodes1, edges1, edges2, streets2, namable, unnamed = trial
+
+    pre_optimization_count = len(planned | extra)
+    final_plan_method = plan.method
+    final_plan_optimal = False
+    optimization_rounds = 0
+    plan_reduced_by = 0
+    grouped = _minimum_original_plan(nodes1, edges2, streets2, st, aoi)
+    notes.extend(grouped.notes)
+    if not grouped.uncovered:
+        candidate = set(grouped.chosen)
+        candidate_order = list(grouped.chosen)
+        candidate_reasons = dict(grouped.reasons)
+        stabilized: set[int] = set()
+        validated = None
+        validation_plan = None
+        validation_unconnectable: list[int] = []
+        for optimization_rounds in range(1, 5):
+            trial = run(candidate, set(), f"minimum-plan validation {optimization_rounds}")
+            additions, add_reasons, check, check_unconnectable = _additional_original_plan(
+                trial[0], trial[2], trial[3], candidate, st, aoi, ref_node)
+            validation_plan = check
+            validation_unconnectable = check_unconnectable
+            by_id = trial[3].set_index("street_id")["street_id_original"].astype(int)
+            if trial[5]:
+                for sid in trial[5]:
+                    oid = int(by_id[int(sid)])
+                    if oid not in candidate and oid not in additions:
+                        additions.append(oid)
+                        add_reasons.setdefault(oid, "after-cutting")
+            additions = [oid for oid in additions if oid not in candidate]
+            if not additions and not trial[5]:
+                validated = trial
+                break
+            for oid in additions:
+                candidate.add(oid)
+                stabilized.add(oid)
+                candidate_order.append(oid)
+                candidate_reasons[oid] = add_reasons.get(oid, "after-cutting")
+        if validated is not None and len(candidate) <= pre_optimization_count:
+            planned, extra = set(candidate), set(stabilized)
+            nodes1, edges1, edges2, streets2, namable, unnamed = validated
+            first_order = {oid: i + 1 for i, oid in enumerate(candidate_order)}
+            reasons = candidate_reasons
+            unconnectable = validation_unconnectable
+            final_plan_method = grouped.method
+            final_plan_optimal = bool(grouped.optimal and not stabilized and validation_plan and validation_plan.optimal)
+            plan_reduced_by = initial_plan_count - len(candidate)
+            if plan_reduced_by:
+                notes.append(f"final-cut optimisation removed {plan_reduced_by} unnecessary naming tasks")
+        else:
+            optimization_rounds = 0
+    elif grouped.uncovered:
+        notes.append(f"the final-cut grouped plan could not cover {len(grouped.uncovered)} street parts")
     say("collecting the results")
     sg = pipeline.streets_gdf_from_edges(edges2, streets2)
     dist, _ = path_numbering.node_distances(nodes0, edges0, ref_xy, backbone_streets=named_ids | planned | extra)
@@ -1146,7 +1594,17 @@ def compute_network(base: BaseData, project: Project, progress=None, roads_repor
         "to_be_named": int(len(allp)), "namable": int(len(namable)),
         "uncovered": int(sum(1 for s, n, b, tb in zip(streets2["street_id"], streets2["street_name"], streets2["branch_name"], streets2["to_be_named"])
                              if int(s) in (namable if aoi is None else namable_need) and not is_named(n) and not isinstance(b, str) and not tb)),
-        "rounds": it,
+        "rounds": it + optimization_rounds,
+        "initial_rounds": it,
+        "optimization_rounds": optimization_rounds,
+        "initial_plan_count": initial_plan_count,
+        "initial_plan_method": initial_plan_method,
+        "initial_plan_optimal": initial_plan_optimal,
+        "pre_optimization_count": pre_optimization_count,
+        "plan_method": final_plan_method,
+        "plan_optimal": final_plan_optimal,
+        "plan_scope": "final_cut_graph",
+        "plan_reduced_by": max(0, initial_plan_count - len(allp)),
     }
     warnings = build_warnings(streets2, namable_need, unconnectable) + (roads_warnings(roads_report, streets2) if roads_report else [])
     parts = disconnected_parts(base)
@@ -1212,6 +1670,13 @@ def _tri(values, lengths) -> bool | None:
     return bool((v * ln * known).sum() >= 0.5 * (ln * known).sum())
 
 
+def _mixed(values) -> bool:
+    """True when the edges of a street do not all have the same flag (yes, no or unknown): the street's flag is then only a summary."""
+    if values is None:
+        return False
+    return len({None if pd.isna(v) else bool(v) for v in values}) > 1
+
+
 def network_geojson(state: NetworkState, project: Project) -> dict:
     """The computed network as GeoJSON for the map.
 
@@ -1247,10 +1712,25 @@ def network_geojson(state: NetworkState, project: Project) -> dict:
         nodes_of.setdefault(int(sid), set()).update((u, v))
     fl = state.edges.reset_index()
     fl = fl[(fl["key"] < roads_mod.SYNTHETIC_KEY) & fl["street_id"].notna()]
+    fl = fl.assign(ref=[roads_mod.edge_ref(u, v, k) for u, v, k in zip(fl["u"], fl["v"], fl["key"])]).drop_duplicates("ref")
+    if aoi is not None:
+        fl = fl[fl["ref"].isin(drawn_refs)]
     fl = fl.assign(_l=fl.geometry.length)
     flags = {}
     for k, g in fl.groupby("street_id"):
-        flags[int(k)] = (_tri(g["drivable_info"] if "drivable_info" in g else None, g["_l"]), _tri(g["paved"] if "paved" in g else None, g["_l"]))
+        access_flags = pd.Series(pd.array([None if pd.isna(v) else v == "car" for v in g["access"]], dtype="boolean"), index=g.index) if "access" in g else (g["drivable_info"] if "drivable_info" in g else None)
+        paved_flags = g["paved"] if "paved" in g else None
+        flags[int(k)] = (_tri(access_flags, g["_l"]), _tri(paved_flags, g["_l"]), _mixed(access_flags), _mixed(paved_flags))
+    edge_wgs = fl.to_crs(4326)
+    edge_feats = []
+    for _, row in edge_wgs.iterrows():
+        value = row.get("access")
+        if value is None or pd.isna(value):
+            value = None
+        edge_feats.append({"type": "Feature", "properties": {"ref": row["ref"], "id": int(row["street_id"]),
+                           "original": int(row.get("street_id_original", row["street_id"])), "access": value,
+                           "track": "track" in str(row.get("highway", ""))},           # OSM tracks: check them in the area review
+                           "geometry": shapely.geometry.mapping(shapely.set_precision(row.geometry, 1e-6))})
     feats = []
     for _, r in sg.iterrows():
         sid = int(r["street_id"])
@@ -1260,7 +1740,8 @@ def network_geojson(state: NetworkState, project: Project) -> dict:
                  "display": r["display_name"] if isinstance(r["display_name"], str) else None,
                  "status": status.loc[sid, "status"], "source": status.loc[sid, "source"],
                  "level": None if pd.isna(status.loc[sid, "level"]) else int(status.loc[sid, "level"]),
-                 "rank": int(r["street_rank"]), "highway": r.get("highway"), "drivable": flags.get(sid, (None, None))[0], "paved": flags.get(sid, (None, None))[1], "length": round(float(r["length_m"]), 1),
+                 "rank": int(r["street_rank"]), "highway": r.get("highway"), "drivable": flags.get(sid, (None, None))[0], "paved": flags.get(sid, (None, None))[1],
+                 "drivable_mixed": flags.get(sid, (None, None, False, False))[2], "paved_mixed": flags.get(sid, (None, None, False, False))[3], "length": round(float(r["length_m"]), 1),
                  "d0": round(min(dv), 1) if dv else None, "d1": round(max(dv), 1) if dv else None,
                  "parent": None if pd.isna(r["branch_parent_id"]) else int(r["branch_parent_id"]),
                  "root": None if pd.isna(r["branch_root_id"]) else int(r["branch_root_id"])}
@@ -1285,7 +1766,8 @@ def network_geojson(state: NetworkState, project: Project) -> dict:
             if len(sp) >= 3 or len({x["id"] for x in sp}) >= 2:
                 kept.append(f)
         junctions["features"] = kept
-    return {"junctions": junctions, "streets": {"type": "FeatureCollection", "features": feats}, "cuts": {"type": "FeatureCollection", "features": cuts},
+    return {"junctions": junctions, "streets": {"type": "FeatureCollection", "features": feats},
+            "edges": {"type": "FeatureCollection", "features": edge_feats}, "cuts": {"type": "FeatureCollection", "features": cuts},
             "reference": {"lat": rlat, "lon": rlon, "node": state.reference["node"]},
             "plan": state.plan.to_dict("records"), "stats": state.stats, "notes": state.notes, "warnings": state.warnings}
 
@@ -1547,6 +2029,163 @@ def add_outside_signs(base: BaseData, state: NetworkState, signs: gpd.GeoDataFra
                                 "bearing": round((math.degrees(math.atan2(bx, by)) + 360) % 360, 0)})
 
 
+def no_address_streets(streets_gdf: gpd.GeoDataFrame, attrs: dict | None) -> set[int]:
+    """Street ids of the paths marked "gives no addresses" (``{"addresses": False}`` in the street attributes).
+
+    Args:
+        streets_gdf: Computed streets with ``street_id``, ``street_id_original`` and ``street_part``.
+        attrs: ``project.roads["attrs"]``: ``{"114": {...}}`` for the whole original street, ``{"114:2": {...}}`` for one part.
+
+    Returns:
+        The computed street ids.
+    """
+    out: set[int] = set()
+    if not attrs:
+        return out
+    orig = (streets_gdf["street_id_original"] if "street_id_original" in streets_gdf.columns else streets_gdf["street_id"]).astype(int).to_numpy()
+    part = streets_gdf["street_part"].astype(int).to_numpy() if "street_part" in streets_gdf.columns else np.zeros(len(streets_gdf), dtype=int)
+    sids = streets_gdf["street_id"].astype(int).to_numpy()
+    for key, a in attrs.items():
+        if not isinstance(a, dict) or a.get("addresses") is not False:
+            continue
+        o, _, pt = str(key).partition(":")
+        m = orig == int(o)
+        if pt:
+            m &= part == int(pt)
+        out |= {int(x) for x in sids[m]}
+    return out
+
+
+class _PathAccess:
+    """Walks from a house on a path that gives no addresses to the first street that does (see :func:`compute_addresses`)."""
+
+    def __init__(self, state: NetworkState, give: set[int], no_addr: set[int]):
+        """Index the network once.
+
+        Args:
+            state: The computed network.
+            give: Street ids that give addresses.
+            no_addr: Street ids of the paths that do not.
+        """
+        ed = state.edges.reset_index()
+        ed = ed[ed["street_id"].notna()]
+        self.node_streets: dict = {}
+        self.street_nodes: dict = {}
+        self.adj: dict = {}
+        for u, v, sid, g in zip(ed["u"], ed["v"], ed["street_id"].astype(int), ed.geometry):
+            for n in (u, v):
+                self.node_streets.setdefault(n, set()).add(sid)
+            self.street_nodes.setdefault(sid, set()).update((u, v))
+            if sid in no_addr:
+                self.adj.setdefault(u, []).append((v, float(g.length), g))
+                self.adj.setdefault(v, []).append((u, float(g.length), g))
+        self.pt = state.nodes.geometry
+        self.give = give
+
+    def walk(self, path_sid: int, path_geom, along: float):
+        """Shortest walk along the no-address paths to a node of an address-giving street.
+
+        Args:
+            path_sid: The path the house is on.
+            path_geom: Its line.
+            along: Position of the house's projection on that line.
+
+        Returns:
+            ``(node, walked metres, a point about 5 m back along the path from the node)``, or None when no such street is reached.
+        """
+        import heapq
+        q = path_geom.interpolate(along)
+        line = path_geom.geom_type == "LineString"
+        heap, best, came = [], {}, {}
+        for n in self.street_nodes.get(path_sid, ()):
+            npt = self.pt.loc[n]
+            d0 = abs(path_geom.project(npt) - along) if line else q.distance(npt)
+            if d0 < best.get(n, math.inf):
+                best[n] = d0
+                heapq.heappush(heap, (d0, n))
+        while heap:
+            d, n = heapq.heappop(heap)
+            if d > best.get(n, math.inf):
+                continue
+            if self.node_streets.get(n, set()) & self.give:
+                g = came.get(n)
+                npt = self.pt.loc[n]
+                if g is None:                                     # the house's own path reaches the street here
+                    at = path_geom.project(npt) if line else 0.0
+                    back = path_geom.interpolate(at + 5.0 if at < along else at - 5.0) if line else q
+                else:
+                    at = g.project(npt)
+                    back = g.interpolate(at + 5.0 if at < g.length / 2 else at - 5.0)
+                return n, d, back
+            for m, length, g in self.adj.get(n, ()):
+                nd = d + length
+                if nd < best.get(m, math.inf):
+                    best[m], came[m] = nd, g
+                    heapq.heappush(heap, (nd, m))
+        return None
+
+
+def apply_register(houses: gpd.GeoDataFrame, register: dict | None) -> gpd.GeoDataFrame:
+    """Overlay the address register on freshly computed houses: a validated address changes only when the change is validated.
+
+    * an approved house shows its approved address, whatever the computation now says (``computed_address`` / ``computed_plate``
+      keep the new values and ``changed`` tells when they differ: listed for validation, never applied on its own);
+    * a house that is not approved yet whose number is already taken on that street by an approved (or retired) address gets the
+      next free letter (``230C``): a number is never given twice.
+
+    Args:
+        houses: ``AddressState.houses``.
+        register: ``project.register``.
+
+    Returns:
+        A copy with ``code``, ``register_status`` (``draft``, ``approved``, ``retired``), ``computed_address``, ``changed``,
+        ``approved_at`` and ``approved_by``.
+    """
+    h = houses.copy()
+    reg = register or {}
+    if "plate" not in h.columns:
+        h["plate"] = None
+    h["computed_address"] = h["address"]
+    h["computed_plate"] = h["plate"]
+    bid = h["building_id"].astype(str).tolist()
+    status = [reg.get(b, {}).get("status", "draft") for b in bid]
+    h["register_status"] = status
+    h["code"] = [reg.get(b, {}).get("code") for b in bid]
+    h["approved_at"] = [reg.get(b, {}).get("approved_at") for b in bid]
+    h["approved_by"] = [reg.get(b, {}).get("approved_by") for b in bid]
+    known = lambda x: x is not None and x == x                      # noqa: E731 - not None and not NaN
+    taken: set = set()
+    for r in reg.values():
+        if r.get("status") in ("approved", "retired") and known(r.get("street_id")) and r.get("number"):
+            taken.add((int(r["street_id"]), str(r["number"])))
+    addr, num, sid, street = h["address"].tolist(), h["number"].tolist(), h["street_id"].tolist(), h["street"].tolist()
+    plates = h["plate"].tolist()
+    changed = [False] * len(h)
+    for i, b in enumerate(bid):
+        r = reg.get(b)
+        if r and r.get("status") == "approved":
+            # the address on the plaque (TCK 0575 0230) decides; registers written before it existed compare the written address
+            changed[i] = (plates[i] != r.get("plate")) if r.get("plate") else addr[i] != r.get("address")
+            addr[i], num[i], sid[i], street[i] = r.get("address"), r.get("number"), r.get("street_id"), r.get("street")
+            plates[i] = r.get("plate") or plates[i]
+    used = set(taken) | {(int(s_), str(n_)) for s_, n_, st_ in zip(sid, num, status) if st_ == "draft" and known(s_) and n_}
+    for i in range(len(bid)):
+        if status[i] != "draft" or not known(sid[i]) or not num[i] or (int(sid[i]), str(num[i])) not in taken:
+            continue
+        base_ = "".join(ch for ch in str(num[i]) if ch.isdigit())
+        k = 0
+        while (int(sid[i]), f"{base_}{numbering.number_letter(k)}") in used:
+            k += 1
+        new = f"{base_}{numbering.number_letter(k)}"
+        used.add((int(sid[i]), new))
+        addr[i] = f"{new}, {street[i]}" if isinstance(street[i], str) and street[i] else str(addr[i] or "").replace(str(num[i]), new, 1)
+        plates[i] = plate_mod.with_number(plates[i], new)
+        num[i] = new
+    h["address"], h["number"], h["street_id"], h["street"], h["changed"] = addr, num, sid, street, changed
+    h["plate"] = plates
+    return h
+
+
 def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> AddressState:
     """House numbers, complete addresses and street signs.
 
@@ -1554,7 +2193,9 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
     ``max_house_distance_m``; a point chosen by hand (``project.access``, any distance up to 60 m from a street) wins.
     From that point come the position along the street (the street's path-numbering profile) and the number; the side
     (odd on the left, even on the right) is the side of the street the *house* is on. Houses that share a street, side
-    and number get a letter (``12A``, ``12B``). The address is ``"<number>, <street name>"`` with the own name, the derived
+    and number get a letter (``12A``, ``12B``). A house whose nearest street is a path marked "gives no addresses" takes the
+    number of the point where that path (through other such paths) reaches a street that gives addresses, with a letter in
+    walking order from that street (``230A``, ``230B``; see ``docs/requirements.md``, 13 November). The address is ``"<number>, <street name>"`` with the own name, the derived
     name (``3-xyz``) or the stand-in ``#id`` while the street still has to be named (status ``pending_name``).
 
     Args:
@@ -1607,6 +2248,11 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
     sid_of = [None] * n
     dist_of = [np.nan] * n
     road_xy = [None] * n                                      # the point of the street the number is taken from
+    order = [None] * n                                        # position along the street, then metres walked along the path
+    via = [None] * n                                          # the no-address path a house is reached by
+    no_addr = no_address_streets(sg, (project.roads or {}).get("attrs"))
+    walker = _PathAccess(state, set(sg["street_id"].astype(int)) - no_addr, no_addr) if no_addr else None
+    sg_row = {int(s_): k for k, s_ in enumerate(sg["street_id"].astype(int))}
     for i, (t, dd) in match.items():
         row = sg.iloc[t]
         geom, profile = _street_geometry(row)
@@ -1615,6 +2261,27 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
         if geom.geom_type == "MultiLineString":
             geom = min(geom.geoms, key=lambda g: g.distance(ref_pt))
         a = geom.project(ref_pt)
+        if walker is not None and i not in manual and int(row["street_id"]) in no_addr:
+            got = walker.walk(int(row["street_id"]), geom, a)
+            cand = sorted((s_ for s_ in walker.node_streets.get(got[0], ()) if s_ in walker.give and s_ in sg_row),
+                          key=lambda s_: (int(sg.iloc[sg_row[s_]]["street_rank"]), s_)) if got is not None else []
+            if cand:
+                node, walked, back = got
+                row2 = sg.iloc[sg_row[cand[0]]]
+                geom2, profile2 = _street_geometry(row2)
+                npt = walker.pt.loc[node]
+                if geom2.geom_type == "MultiLineString":
+                    geom2 = min(geom2.geoms, key=lambda g: g.distance(npt))
+                a2 = geom2.project(npt)
+                sd = _side_at(geom2, a2, back)
+                q = geom2.interpolate(a2)
+                pos = numbering.profile_position(profile2, a2) if isinstance(profile2, str) and profile2 else a2
+                side_src[i], road_xy[i], via[i] = "path", (q.x, q.y), int(row["street_id"])
+                number[i] = numbering._house_number_from_distance(pos, st.house_step_m, sd)
+                side[i], along[i], sid_of[i] = sd, pos, int(row2["street_id"])
+                dist_of[i] = float(walked + house.distance(geom.interpolate(a)))
+                order[i] = (pos, float(walked))
+                continue
         sd_loc = _side_at(geom, a, house) if i in manual else numbering._side_of_line(house, geom)
         sd_az = side_from_azimuth(geom, a, azimuths[i]) if azimuths is not None else None
         sd = sd_az or sd_loc                                  # the direction the surveyor pointed beats the (possibly shifted) position
@@ -1624,10 +2291,11 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
         pos = numbering.profile_position(profile, a) if isinstance(profile, str) and profile else a
         number[i] = numbering._house_number_from_distance(pos, st.house_step_m, sd)
         side[i], along[i], sid_of[i], dist_of[i] = sd, pos, int(row["street_id"]), float(house.distance(ref_pt))
+        order[i] = (pos, 0.0)
     ok = [i for i in range(n) if number[i] is not None]
     labels = {}
     if ok:
-        got = numbering.add_letters([number[i] for i in ok], [(sid_of[i], side[i], number[i]) for i in ok], [along[i] for i in ok])
+        got = numbering.add_letters([number[i] for i in ok], [(sid_of[i], side[i], number[i]) for i in ok], [order[i] for i in ok])
         labels = dict(zip(ok, got))
     disp = state.streets.set_index("street_id")["display_name"].to_dict()
     address, status, street = [], [], []
@@ -1658,6 +2326,7 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
     houses["road_lon"], houses["road_lat"] = [r[0] for r in rll], [r[1] for r in rll]
     houses["azimuth"] = pts["azimuth"].to_numpy() if "azimuth" in pts.columns else np.nan
     houses["source"] = ["manual" if i in manual else "auto" for i in range(n)]
+    houses["via_path"] = via
     houses["access_lat"] = [manual[i]["lat"] if i in manual else None for i in range(n)]
     houses["access_lon"] = [manual[i]["lon"] if i in manual else None for i in range(n)]
 
@@ -1704,7 +2373,8 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
                       "buildings": [bid[i] for i, s_ in enumerate(status) if s_ == "no_street"], "count": stats["no_street"], "streets": []})
     if stats["pending_name"]:
         warns.append({"code": "pending_name", "severity": "warning", "title": f"{stats['pending_name']} houses are on a street that is still to be named",
-                      "message": "Their address shows #<street id> until the street gets a name; naming it (and computing again) fills it in.",
+                      "message": "Their address uses the street's number (TCK 0575 0230) until the street gets an official name; "
+                                 "naming it changes the street part to its four-letter code (TCK KUET 0230).",
                       "buildings": [bid[i] for i, s_ in enumerate(status) if s_ == "pending_name"], "count": stats["pending_name"],
                       "streets": sorted({sid_of[i] for i, s_ in enumerate(status) if s_ == "pending_name"})})
     if stats["no_name"]:
@@ -1712,4 +2382,21 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
                       "message": "The street has neither a name, a derived name nor a planned name: see the warnings of the Names tab.",
                       "buildings": [bid[i] for i, s_ in enumerate(status) if s_ == "no_name"], "count": stats["no_name"],
                       "streets": sorted({sid_of[i] for i, s_ in enumerate(status) if s_ == "no_name"})})
+    fixes = (project.roads or {}).get("quartier") or {}
+    if fixes and "district" in houses.columns:                 # a survey quartier corrected by hand (Bai, J, Unknown ...)
+        houses["survey_district"] = houses["district"]
+        houses["district"] = [fixes.get(str(b), d) for b, d in zip(houses["building_id"], houses["district"])]
+    houses, pstats = plate_mod.add_plates(houses, state.streets, st.branch_step_m)   # TCK (447D)KUET 0230 (15 November format)
+    stats.update({k: v for k, v in pstats.items() if k != "street_code_conflicts"})
+    if pstats["plates_missing_quartier"]:
+        warns.append({"code": "unknown_quartier", "severity": "warning",
+                      "title": f"{pstats['plates_missing_quartier']} houses have a quartier that is not in the catalogue",
+                      "message": "Their survey quartier (" + ", ".join(pstats["unknown_quartiers"][:8]) + ") has no trigram in Overview "
+                                 "Abbreviations, so their address has no quartier code. Add the name as a variant of the right quartier.",
+                      "buildings": [b for b, t, n_ in zip(houses["building_id"], houses["quartier_code"], houses["number"]) if t is None and n_],
+                      "count": pstats["plates_missing_quartier"], "streets": []})
+    for c in pstats["street_code_conflicts"]:
+        warns.append({"code": "street_code_twice", "severity": "warning", "title": f"Two named streets share the code {c['code']}",
+                      "message": " / ".join(c["streets"]) + ": give one of them another four-letter code before printing plaques.",
+                      "buildings": [], "count": len(c["streets"]), "streets": c["street_ids"]})
     return AddressState(houses, signs, stats, warns)

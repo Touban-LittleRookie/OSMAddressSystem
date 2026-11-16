@@ -1,9 +1,7 @@
-# Automatic HTTPS and a shared password for the editors (no accounts in the app).
-# Make the hash with:  docker run --rm caddy caddy hash-password
+# Automatic HTTPS. The application provides individual invited accounts,
+# server-enforced roles and revocable sessions; do not add a shared password.
 addresses.example.org {
-	basic_auth {
-		editors REPLACE_WITH_THE_HASH
-	}
+	encode zstd gzip
 	request_body { max_size 60MB }
 	reverse_proxy app:8000
 }

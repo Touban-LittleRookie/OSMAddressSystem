@@ -62,6 +62,7 @@ DEFAULT_HIGHWAY_RANKS = {
     "living_street": 4,
     "service": 4,
     "road": 4,
+    "track": 4,  # decided 5 November: in Fotouni most tracks are real dirt roads cars use
     # rank 5 ("footway") entries are appended below, derived from
     # DEFAULT_NON_DRIVABLE_HIGHWAYS, so the two sets can never drift
     # apart.
@@ -229,7 +230,6 @@ DEFAULT_NON_DRIVABLE_HIGHWAYS = {
     "cycleway",
     "bridleway",
     "corridor",
-    "track",
 }
 
 # Rank 5 ("footway") is exactly DEFAULT_NON_DRIVABLE_HIGHWAYS - derived

@@ -4,6 +4,36 @@ import app_helpers as H
 from osmaddresssystem.app.store import Store
 
 
+def test_context_menu_starts_a_two_point_route_at_the_right_clicked_road(live_app):
+    url, _root = live_app
+    with playwright_sync_api.sync_playwright() as pw:
+        browser = H.launch_browser(pw)
+        page = browser.new_page(viewport={'width': 1600, 'height': 1000})
+        errors = []
+        page.on('pageerror', lambda e: errors.append(str(e)))
+        lon, lat = H.lonlat(H.X0 + 120, H.Y0 + 120)
+        page.request.post(url + '/api/reference', data={'lon': lon, 'lat': lat})
+        page.goto(url, wait_until='domcontentloaded')
+        page.wait_for_function('S.ready')
+        page.locator('#ref-confirm').click()
+        page.locator('#tabs button[data-tab=roads]').click()
+        page.wait_for_function('S.tab === "roads" && !S.locked')
+        point = page.evaluate('''async()=>{
+          const data=await api('/roads/geometry');
+          const road=data.edges.features.find(f=>f.geometry.coordinates.length===2);
+          map.fitBounds(L.geoJSON(road).getBounds().pad(.6),{animate:false});
+          const c=road.geometry.coordinates,a=c[0],b=c[c.length-1];
+          const p=map.latLngToContainerPoint([(a[1]+b[1])/2,(a[0]+b[0])/2]),r=map.getContainer().getBoundingClientRect();
+          return {x:r.left+p.x,y:r.top+p.y};
+        }''')
+        page.mouse.click(point['x'], point['y'], button='right')
+        page.locator('[data-road-action=route]').click()
+        page.wait_for_function('S.draw?.mode === "route" && S.draw?.phase === "end" && S.draw?.pts.length === 1')
+        assert page.locator('#side').get_by_text('Click the planned ending point.', exact=False).is_visible()
+        assert errors == []
+        browser.close()
+
+
 def test_context_delete_and_join(live_app):
     url, root=live_app
     with playwright_sync_api.sync_playwright() as pw:

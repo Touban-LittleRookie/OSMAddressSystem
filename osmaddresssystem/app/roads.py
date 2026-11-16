@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -202,7 +203,11 @@ def node_lines(features: list[dict], crs, tol_m: float = 1.0) -> NodedRoads:
             continue
         coords = [a] + list(p.coords)[1:-1] + [b]
         mid = p.interpolate(0.5, normalized=True)
-        owner = next((meta[i] for i, g in enumerate(lines) if g.distance(mid) <= tol_m + 0.01), meta[0])
+        # When a deleted road is drawn again at the same place, the newest
+        # import is the replacement.  Keeping the oldest owner made its old
+        # saved cut delete the replacement immediately during recomputation.
+        owner = next((meta[i] for i in range(len(lines) - 1, -1, -1)
+                      if lines[i].distance(mid) <= tol_m + 0.01), meta[-1])
         out.nodes[ua], out.nodes[ub] = a, b
         out.pieces.append({"u": ua, "v": ub, "geom": LineString(coords), "feature": owner["key"], "name": owner.get("name"),
                            "highway": owner.get("highway")})
@@ -247,16 +252,54 @@ def edge_ref(u, v, key) -> str:
     return f"{a}-{b}-{int(key)}"
 
 
-def reshape_edges(edges: gpd.GeoDataFrame, geometry: dict) -> gpd.GeoDataFrame:
+def apply_node_moves(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, moves: dict | None) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
+    """Move nodes saved by a reshape across several sections (``{node: [lon, lat]}``), taking every road end at them along.
+
+    Side roads stay connected: only their last point moves to the junction's new place.
+
+    Returns:
+        ``(nodes, edges, moved_from)``: ``moved_from`` maps each moved node to its old projected position, so an older shape
+        override that still ends at the old place keeps applying (see :func:`reshape_edges`).
+    """
+    if not moves:
+        return nodes, edges, {}
+    tr = Transformer.from_crs(4326, edges.crs, always_xy=True)
+    to = {int(n): tr.transform(*p) for n, p in moves.items() if int(n) in nodes.index}
+    if not to:
+        return nodes, edges, {}
+    moved_from = {n: tuple(nodes.geometry.loc[n].coords[0]) for n in to}
+    nodes, edges = nodes.copy(), edges.copy()
+    for n, (x, y) in to.items():
+        nodes.at[n, "geometry"] = Point(x, y)
+        if "x" in nodes:
+            nodes.at[n, "x"], nodes.at[n, "y"] = x, y
+    for (u, v, k), geom in zip(list(edges.index), list(edges.geometry)):
+        if u in to or v in to:
+            coords = list(geom.coords)
+            if u in to:
+                coords[0] = to[u]
+            if v in to:
+                coords[-1] = to[v]
+            line = LineString(coords)
+            edges.at[(u, v, k), "geometry"] = line
+            edges.at[(u, v, k), "length"] = line.length
+    return nodes, edges, moved_from
+
+
+def reshape_edges(edges: gpd.GeoDataFrame, geometry: dict, moved_from: dict | None = None) -> gpd.GeoDataFrame:
     """Apply WGS84 shape overrides to both directions, keeping graph endpoints.
 
     An obsolete reference or moved endpoint is ignored rather than attaching an
-    old correction to a different road. Junctions are never created or moved.
+    old correction to a different road. Junctions are never created; they move only with a reshape across several
+    sections (:func:`apply_node_moves`), and the end of a dead end may move (up to ``DEAD_END_MOVE_M``), see
+    :func:`move_dead_end_nodes`.
     """
     if not geometry:
         return edges
     edges = edges.copy()
     tr = Transformer.from_crs(4326, edges.crs, always_xy=True)
+    ends = dead_ends(edges)
+    moved_from = moved_from or {}
     for (u, v, k), row in edges.iterrows():
         coords = geometry.get(edge_ref(u, v, k))
         if not coords:
@@ -265,13 +308,52 @@ def reshape_edges(edges: gpd.GeoDataFrame, geometry: dict) -> gpd.GeoDataFrame:
         if int(u) > int(v):
             points.reverse()
         original = list(row.geometry.coords)
-        if Point(points[0]).distance(Point(original[0])) > 1 or Point(points[-1]).distance(Point(original[-1])) > 1:
+        def fits(new, old, node):
+            d = Point(new).distance(Point(old))
+            return d <= 1 or (node in ends and d <= DEAD_END_MOVE_M) or (node in moved_from and Point(new).distance(Point(moved_from[node])) <= 1)
+        if not fits(points[0], original[0], u) or not fits(points[-1], original[-1], v):
             continue
-        points[0], points[-1] = original[0], original[-1]
+        if u not in ends or u in moved_from or Point(points[0]).distance(Point(original[0])) <= 1:
+            points[0] = original[0]
+        if v not in ends or v in moved_from or Point(points[-1]).distance(Point(original[-1])) <= 1:
+            points[-1] = original[-1]
         line = LineString(points)
         edges.at[(u, v, k), "geometry"] = line
         edges.at[(u, v, k), "length"] = line.length
     return edges
+
+
+DEAD_END_MOVE_M = 30.0
+"""How far a partial reshape may move the end of a dead end (the anchor click may be 25 m from the old line)."""
+
+
+def dead_ends(edges: gpd.GeoDataFrame) -> set:
+    """Nodes with a single neighbour: the free end of a road, the only kind of node a reshape may move."""
+    neighbours: dict = {}
+    for u, v, _k in edges.index:
+        if u != v:
+            neighbours.setdefault(u, set()).add(v)
+            neighbours.setdefault(v, set()).add(u)
+    return {n for n, near in neighbours.items() if len(near) == 1}
+
+
+def move_dead_end_nodes(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Put each dead-end node where its (reshaped) road now ends, so the node and its road stay together."""
+    ends = dead_ends(edges)
+    moved = {}
+    for (u, v, _k), geom in zip(edges.index, edges.geometry):
+        coords = list(geom.coords)
+        for node, xy in ((u, coords[0]), (v, coords[-1])):
+            if node in ends and node in nodes.index and nodes.geometry.loc[node].distance(Point(xy)) > 0.01:
+                moved[node] = xy
+    if not moved:
+        return nodes
+    nodes = nodes.copy()
+    for node, (x, y) in moved.items():
+        nodes.at[node, "geometry"] = Point(x, y)
+        if "x" in nodes:
+            nodes.at[node, "x"], nodes.at[node, "y"] = x, y
+    return nodes
 
 
 def drop_edges(edges: gpd.GeoDataFrame, streets: pd.DataFrame, refs) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
@@ -414,6 +496,23 @@ def _find_duplicates(edges: gpd.GeoDataFrame, pieces: list, final_id: dict, base
     return out
 
 
+def _with_lineage(row: pd.Series, parent: tuple) -> pd.Series:
+    """Let a piece that replaces a road remember the references of that road (nearest first).
+
+    Choices stored per road reference, such as the access class, then follow the pieces after a split, a cut or a connection.
+
+    Args:
+        row: Copy of the replaced road's row.
+        parent: ``(u, v, key)`` of the replaced road.
+
+    Returns:
+        ``row`` with ``ref_lineage`` set (``"<ref>|<older ref>|..."``).
+    """
+    old = row.get("ref_lineage")
+    row["ref_lineage"] = edge_ref(*parent) + (f"|{old}" if isinstance(old, str) and old else "")
+    return row
+
+
 def _split_edge(edges: gpd.GeoDataFrame, ukey: tuple, point: Point, new_id: int, crs) -> tuple[gpd.GeoDataFrame, tuple | None]:
     """Split one road (both directed rows) at the point of it nearest to ``point``.
 
@@ -447,7 +546,7 @@ def _split_edge(edges: gpd.GeoDataFrame, ukey: tuple, point: Point, new_id: int,
         else:
             p1, p2 = LineString(list(second.coords)[::-1]), LineString(list(first.coords)[::-1])
         for (x, y), geo in (((a, new_id), p1), ((new_id, b), p2)):
-            nr = r.copy()
+            nr = _with_lineage(r.copy(), (a, b, key))
             nr["geometry"], nr["length"], nr["is_main_direction"], nr["nearest_main_eid"] = geo, geo.length, False, ""
             rows.append(((x, y, key), nr))
         mapping.append(((a, b, key), (a, new_id, key), (new_id, b, key)))
@@ -525,7 +624,7 @@ def join_endpoint(nodes, edges, join, edits=None):
     additions, mapping = [], []
     for i in affected:
         u, v, key = i
-        row = edges.loc[i].copy()
+        row = _with_lineage(edges.loc[i].copy(), i)
         coords = list(row.geometry.coords)
         coords[0 if u == source else -1] = (point.x, point.y)
         u, v = (target_node if u == source else u), (target_node if v == source else v)
@@ -542,14 +641,77 @@ def join_endpoint(nodes, edges, join, edits=None):
     return nodes, edges, edits
 
 
-def cut_sections(nodes, edges, streets, cuts, edits=None, removed=(), geometry=None, joins=()):
+def ref_nodes(ref: str) -> set:
+    """The two end nodes of an edge reference ``"u-v-key"`` (node ids may be negative)."""
+    m = re.fullmatch(r"(-?\d+)-(-?\d+)-(\d+)", str(ref))
+    return {int(m.group(1)), int(m.group(2))} if m else set()
+
+
+def cuts_before_drawn_roads(cuts: list, joins: list) -> tuple[list, list]:
+    """Try saved cuts before newly drawn roads can split their section references.
+
+    :func:`cut_sections` defers a cut automatically when its section does not exist yet (for example, a section created by an
+    earlier join).  A cut whose section already exists must be attempted now even when an older join touches one of its nodes;
+    postponing it lets a later drawn connector split the reference and makes the cut stale.
+
+    Returns:
+        ``(early, late)``, each cut with its ``order``.
+    """
+    def created_sections(join):
+        """Endpoint pairs of sections a join can create (the edge key is irrelevant here)."""
+        source = int(join['source_node'])
+        other = ref_nodes(join['ref']) - {source}
+        target = ref_nodes(join['target_ref'])
+        if len(other) != 1 or len(target) != 2:
+            return []
+        other = next(iter(other))
+        u, v = sorted(target)
+        interior = -int(hashlib.sha256(f"{join['id']}:join".encode()).hexdigest()[:11], 16) - 1
+        # The source edge moves to an endpoint or to the new interior node.  An interior connection also splits the target.
+        return [{other, u}, {other, v}, {other, interior}, {u, interior}, {interior, v}]
+
+    made = [(int(join['order']), {str(join['ref']), str(join['target_ref'])}, created_sections(join)) for join in joins]
+    early, late = [], []
+    for i, value in enumerate(cuts):
+        cut = {**value, 'order': value.get('order') or i + 1}
+        nodes = ref_nodes(cut['ref'])
+        depends = any(order < cut['order'] and (cut['ref'] in refs or nodes in sections)
+                      for order, refs, sections in made)
+        (late if depends else early).append(cut)
+    return early, late
+
+
+def _already_cut(cut, cut_away, crs, tol_m=1.0) -> bool:
+    """Whether the removed interval of a cut lies on portions that earlier cuts removed (within ``tol_m``)."""
+    if not cut_away:
+        return False
+    line = gpd.GeoSeries([LineString(cut['coords'])], crs=4326).to_crs(crs).iloc[0]
+    part = substring(line, cut['start_m'], cut['end_m'])
+    return unary_union(cut_away).buffer(tol_m).covers(part)
+
+
+def cut_sections(nodes, edges, streets, cuts, edits=None, removed=(), geometry=None, joins=(), defer=None, consumed=None,
+                 cut_away=None, import_events=None, drawn_features=None):
     """Remove only selected intervals, retaining directed outside fragments.
 
     Stable negative node IDs keep subsequent edits on fragments reproducible.
     Source files are untouched. Old CSV decisions follow the retained pieces.
+
+    ``defer`` (a list) collects the cuts whose section is not there (yet) instead of reporting them; ``consumed`` (a set)
+    carries the references already cut by an earlier pass and ``cut_away`` (a list) the portions removed so far. A cut whose
+    section is gone but which lies on a portion already removed is done (the same portion deleted twice).
     """
     nodes, edges = nodes.copy(), edges.copy()
-    stale, consumed = [], set()
+    stale = []
+    consumed = set() if consumed is None else consumed
+    cut_away = [] if cut_away is None else cut_away
+    import_events = import_events or {}
+    drawn_sources = []
+    for feature in drawn_features or ():
+        coords = feature.get('coords') or []
+        if len(coords) >= 2:
+            source_geom = gpd.GeoSeries([LineString(coords)], crs=4326).to_crs(edges.crs).iloc[0]
+            drawn_sources.append((f"road{feature['key']}", source_geom))
     operations = [{**op, 'kind':'cut', 'order':op.get('order', i+1)} for i,op in enumerate(cuts)]
     operations += [{**op,'kind':'join'} for op in joins]
     for cut in sorted(operations,key=lambda op:op['order']):
@@ -562,25 +724,58 @@ def cut_sections(nodes, edges, streets, cuts, edits=None, removed=(), geometry=N
             # A fragment only exists after its parent's cut has been replayed.
             # Apply its saved reshape before validating/cutting that fragment.
             edges = reshape_edges(edges, {cut['ref']: geometry[cut['ref']]})
+        expected = gpd.GeoSeries([LineString(cut['coords'])], crs=4326).to_crs(edges.crs).iloc[0]
         idx = next((idx for idx in edges.index if idx[0] < idx[1] and edge_ref(*idx) == cut['ref']), None)
+        matched_by_geometry = False
         if idx is None:
-            if cut['ref'] not in removed and cut['ref'] not in consumed:
+            # Noding another hand-drawn road can merge a nearby endpoint and
+            # change only this section's generated node id.  The physical road
+            # is still the same, so keep the saved cut attached to its unique
+            # near-identical geometry instead of resurrecting the old line.
+            source_matches = [osmid for osmid, source in drawn_sources
+                              if source.hausdorff_distance(expected) <= 5.0
+                              and abs(source.length - expected.length) <= 5.0]
+            source_osmid = source_matches[0] if len(source_matches) == 1 else None
+            tolerance = 5.0 if source_osmid else 1.0
+            matches = [key for key, row in edges.iterrows() if key[0] < key[1]
+                       and (source_osmid is None or str(row.get('osmid', '')) == source_osmid)
+                       and row.geometry.hausdorff_distance(expected) <= tolerance
+                       and abs(row.geometry.length - expected.length) <= tolerance]
+            if len(matches) == 1:
+                idx = matches[0]
+                matched_by_geometry = tolerance
+        if idx is None:
+            if defer is not None:
+                defer.append(cut)
+            elif cut['ref'] not in removed and cut['ref'] not in consumed and not _already_cut(cut, cut_away, edges.crs):
                 stale.append(cut['ref'])
             continue
         u, v, k = idx
+        osmid = str(edges.loc[idx].get('osmid', ''))
+        match = re.fullmatch(r'road(\d+):.*', osmid)
+        import_event = import_events.get(int(match.group(1))) if match else None
+        if import_event is not None and int(import_event) > int(cut.get('_event_id', import_event)):
+            # This stable edge identity has been recreated by a later drawing.
+            # The cut belongs to the older version and must not erase the new one.
+            consumed.add(cut['ref'])
+            continue
         geom = edges.loc[idx].geometry
-        expected = gpd.GeoSeries([LineString(cut['coords'])], crs=4326).to_crs(edges.crs).iloc[0]
-        if geom.hausdorff_distance(expected) > .2 or abs(geom.length-expected.length) > .2:
-            stale.append(cut['ref'])
+        identity_tolerance = float(matched_by_geometry) if matched_by_geometry else .2
+        if geom.hausdorff_distance(expected) > identity_tolerance or abs(geom.length-expected.length) > identity_tolerance:
+            (defer if defer is not None else stale).append(cut if defer is not None else cut['ref'])
             continue
         a, b = cut['start_m'], cut['end_m']
+        cut_away.append(substring(geom, a, b))
         ids = [u, v]
         for i, distance in enumerate((a, b)):
             if .5 <= distance <= geom.length-.5:
                 nid = -int(hashlib.sha256(f"{cut['id']}:{i}".encode()).hexdigest()[:11], 16)-1
                 pt = geom.interpolate(distance)
                 if nid in nodes.index:
-                    raise ValueError('cut node ID collision; undo and retry the cut')
+                    if nodes.geometry.loc[nid].distance(pt) <= .05:
+                        ids[i] = nid
+                        continue
+                    raise ValueError(f"cut node ID collision for {cut['id']} ({cut['ref']}); undo and retry the cut")
                 row = nodes.iloc[0].copy()
                 row['x'], row['y'], row['geometry'] = pt.x, pt.y, pt
                 if 'node_id' in nodes:
@@ -601,7 +796,7 @@ def cut_sections(nodes, edges, streets, cuts, edits=None, removed=(), geometry=N
             for x, y, line in pieces:
                 if original != idx:
                     x, y, line = y, x, LineString(list(line.coords)[::-1])
-                row = before.copy()
+                row = _with_lineage(before.copy(), original)
                 row['geometry'], row['length'], row['geom_edited'] = line, line.length, True
                 row['is_main_direction'], row['nearest_main_eid'] = False, ''
                 indexes.append((x, y, k))
@@ -623,9 +818,34 @@ def cut_sections(nodes, edges, streets, cuts, edits=None, removed=(), geometry=N
     return nodes, edges, streets[streets.street_id.astype(int).isin(alive)].copy(), edits, stale
 
 
+def drawn_node_id(key: str, kept: dict, taken) -> int:
+    """The id of a node made for a drawn road: the same whatever other roads are drawn, connected or deleted.
+
+    Ids used to be numbered in sequence, so one new node renumbered the others and the edits saved on their roads (reshape,
+    deleted portion, drivable...) no longer applied. The ids of that time are kept (``kept``); a new node gets an id from its key.
+
+    Args:
+        key: Node key (its position, see :func:`_node_key`).
+        kept: Node key -> id recorded when ids became stable.
+        taken: Ids already in use.
+
+    Returns:
+        The node id (negative for the new ones, like the nodes made by a cut).
+    """
+    if key in kept and int(kept[key]) not in taken:
+        return int(kept[key])
+    salt = 0
+    while True:
+        nid = -int(hashlib.sha256(f"drawn:{key}:{salt}".encode()).hexdigest()[:11], 16) - 1
+        if nid not in taken:
+            return nid
+        salt += 1
+
+
 def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: pd.DataFrame, edge_edits: pd.DataFrame | None,
                     features: list[dict], connections: dict | None = None, auto_m: float = 10.0, suggest_m: float = 25.0,
-                    node_tol_m: float = 1.0, first_street_id: int | None = None, touch_m: float = 10.0, keep: set | None = None) -> RoadsResult:
+                    node_tol_m: float = 1.0, first_street_id: int | None = None, touch_m: float = 10.0, keep: set | None = None,
+                    node_ids: dict | None = None, node_moves: dict | None = None) -> RoadsResult:
     """Add drawn roads to the network (see the module docstring).
 
     Args:
@@ -642,9 +862,13 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
         first_street_id: First street id given to the new streets (default: above every existing id).
         touch_m: A new end lying on an existing road within this distance is connected to it (the road is split).
         keep: References of existing roads that must stay although a new road duplicates them (default: none, the new road wins).
+        node_ids: Ids of the generated nodes by node key, kept from before ids became stable (see :func:`drawn_node_id`).
+            None numbers them in sequence as before, so that those ids can be recorded once.
+        node_moves: Saved WGS84 positions of junctions moved by a reshape.  Drawn nodes must receive these positions before
+            duplicate detection; applying them afterwards lets prolongations snap back to the obsolete position.
 
     Returns:
-        The :class:`RoadsResult`.
+        The :class:`RoadsResult` (``report["node_ids"]``: the id given to each generated node, by node key).
     """
     connections = connections or {}
     crs = edges.crs
@@ -665,6 +889,7 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
     base_ids = np.array(nodes.index)
     base_xy = np.c_[nodes["x"].to_numpy(), nodes["y"].to_numpy()]
     next_node = int(max(base_ids.max(), 0)) + 1
+    stable_key_for_id = {int(value): key for key, value in (node_ids or {}).items()}
     max_sid = int(streets["street_id"].max())
     if edge_edits is not None and len(edge_edits) and "new_street_id" in edge_edits:
         max_sid = max(max_sid, int(pd.to_numeric(edge_edits["new_street_id"], errors="coerce").max() or 0))
@@ -676,6 +901,7 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
     lost_geom = 0
     split_count = 0
     ancestors: dict = {}                 # original (u, v, key) -> current piece keys (a road may be split more than once)
+    generated: dict = {}                 # node key -> id of the nodes made here
 
     def nearest_node(x: float, y: float):
         """Nearest base node as ``(id, distance, x, y)``."""
@@ -702,10 +928,59 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
         c = connections.get(kk)
         if c and c.get("type") == "none":
             status[kk] = {"state": "free", "manual": True}
-        elif c and c.get("type") == "node" and int(c["node"]) in set(base_ids):
+        elif c and c.get("type") == "node":
             nid = int(c["node"])
-            final_id[kk], final_xy[kk] = nid, (float(nodes.loc[nid, "x"]), float(nodes.loc[nid, "y"]))
-            status[kk] = {"state": "connected", "to": "node", "node": nid, "manual": True}
+            if nid in set(base_ids):
+                final_id[kk], final_xy[kk] = nid, (float(nodes.loc[nid, "x"]), float(nodes.loc[nid, "y"]))
+                status[kk] = {"state": "connected", "to": "node", "node": nid, "manual": True}
+            else:
+                # A later hand-drawn road can target a stable node created by
+                # an earlier hand-drawn road.  Those nodes are rebuilt in this
+                # same integration pass, so they are not in ``base_ids`` yet.
+                # Recreate the known node now instead of silently assigning a
+                # new hash id (which invalidates saved cuts and connections).
+                stable_key = stable_key_for_id.get(nid)
+                xy = noded.nodes.get(stable_key) if stable_key is not None else None
+                if xy is None and c.get("lon") is not None and c.get("lat") is not None and nid < 0:
+                    xy = tr_in.transform(float(c["lon"]), float(c["lat"]))
+                if xy is not None and nid < 0:
+                    x_, y_ = float(xy[0]), float(xy[1])
+                    # A stable generated node may originally have been a split
+                    # point on an OSM edge.  If the older drawn feature that
+                    # caused that split was later cut away, merely recreating
+                    # the node leaves it isolated and the base edge rejoins
+                    # across the gap.  Recreate the physical split as well.
+                    nearest = nearest_edge(x_, y_)
+                    if nearest is not None and nearest[1] <= min(touch_m, 5.0):
+                        edges, split = _split_edge(edges, nearest[0], Point(x_, y_), nid, crs)
+                        if split is not None:
+                            _projected_x, _projected_y, mapping = split
+                            split_count += 1
+                            # The base edge is only a lineage reference here.
+                            # Keep the reviewed/saved junction position instead
+                            # of pulling it back onto the older base geometry.
+                            for edge_idx in list(edges.index):
+                                a, b, edge_key = edge_idx
+                                if nid not in (a, b):
+                                    continue
+                                coords = list(edges.loc[edge_idx].geometry.coords)
+                                coords[0 if a == nid else -1] = (x_, y_)
+                                moved_line = LineString(coords)
+                                edges.at[edge_idx, "geometry"] = moved_line
+                                edges.at[edge_idx, "length"] = moved_line.length
+                            existing["edges"] = edges
+                            ancestors[nearest[0]] = [piece for _old, first, second in mapping for piece in (first, second)]
+                            if edge_edits is not None and len(edge_edits):
+                                edge_edits, lost = _rewrite_edge_edits(edge_edits, mapping)
+                                lost_geom += lost
+                    nodes.loc[nid, ["x", "y", "node_id"]] = [x_, y_, nid]
+                    nodes.loc[nid, "geometry"] = Point(x_, y_)
+                    base_ids = np.append(base_ids, nid)
+                    base_xy = np.vstack([base_xy, [x_, y_]])
+                    final_id[kk], final_xy[kk] = nid, (x_, y_)
+                    status[kk] = {"state": "connected", "to": "node", "node": nid, "manual": True}
+                else:
+                    status[kk] = {"state": "free", "manual": True, "error": "that node no longer exists"}
         elif c and c.get("type") == "edge":
             status[kk] = {"state": "pending_edge", "target": c}
         else:
@@ -737,14 +1012,15 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
         if best is None:
             status[kk] = {"state": "free", "manual": True, "error": "that road no longer exists"}
             continue
-        nid = next_node
+        nid = next_node if node_ids is None else drawn_node_id(kk, node_ids, nodes.index)
         edges, info = _split_edge(edges, best, Point(px, py), nid, crs)
         if info is None:                                   # too close to an end: use that end node instead
             node, dist, nx_, ny_ = nearest_node(px, py)
             final_id[kk], final_xy[kk] = int(node), (float(nx_), float(ny_))
             status[kk] = {"state": "connected", "to": "node", "node": int(node), "manual": True}
             continue
-        next_node += 1
+        next_node += node_ids is None
+        generated[kk] = nid
         split_count += 1
         sx, sy, mapping = info
         nodes.loc[nid, ["x", "y", "node_id"]] = [sx, sy, nid]
@@ -759,11 +1035,27 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
         status[kk] = {"state": "connected", "to": "edge", "node": nid, "manual": bool(connections.get(kk)), "edge": list(orig)}
     for kk in keys:                                        # 3. nodes that stay free get new ids
         if kk not in final_id:
-            final_id[kk], final_xy[kk] = next_node, noded.nodes[kk]
-            nodes.loc[next_node, ["x", "y", "node_id"]] = [noded.nodes[kk][0], noded.nodes[kk][1], next_node]
-            nodes.loc[next_node, "geometry"] = Point(*noded.nodes[kk])
-            next_node += 1
+            nid = next_node if node_ids is None else drawn_node_id(kk, node_ids, nodes.index)
+            final_id[kk], final_xy[kk] = nid, noded.nodes[kk]
+            nodes.loc[nid, ["x", "y", "node_id"]] = [noded.nodes[kk][0], noded.nodes[kk][1], nid]
+            nodes.loc[nid, "geometry"] = Point(*noded.nodes[kk])
+            next_node += node_ids is None
+            generated[kk] = nid
     nodes["node_id"] = nodes["node_id"].astype("int64")
+
+    if node_moves:
+        moved_xy = {int(node): tr_in.transform(*point) for node, point in node_moves.items()}
+        for kk, node in final_id.items():
+            if int(node) not in moved_xy:
+                continue
+            final_xy[kk] = moved_xy[int(node)]
+            x, y = final_xy[kk]
+            nodes.at[int(node), "geometry"] = Point(x, y)
+            nodes.at[int(node), "x"], nodes.at[int(node), "y"] = x, y
+        for piece in noded.pieces:
+            coords = list(piece["geom"].coords)
+            coords[0], coords[-1] = final_xy[piece["u"]], final_xy[piece["v"]]
+            piece["geom"] = LineString(coords)
 
     dups = _find_duplicates(edges, noded.pieces, final_id, {int(i) for i in base_ids}, crs, set(keep or ()))   # 3b. the new road wins over duplicates
     gone_refs = {r for d in dups for r in d["refs"]}
@@ -781,6 +1073,8 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
     for f in feats:
         if f in join_of:
             sid_of[f] = join_of[f]
+        elif meta_of[f].get("street_id") is not None:               # given when the road was saved (see Store.import_roads)
+            sid_of[f] = int(meta_of[f]["street_id"])
         else:
             sid_of[f], n_new = sid0 + n_new, n_new + 1
     srow = streets.set_index(streets["street_id"].astype(int))
@@ -864,7 +1158,7 @@ def integrate_roads(nodes: gpd.GeoDataFrame, edges: gpd.GeoDataFrame, streets: p
     dangling = [r["key"] for r in node_rep if r["state"] in ("free", "pending_edge") and r["degree"] == 1]
     report = {"features": len(feats), "pieces": len(noded.pieces), "nodes": node_rep, "dangling": dangling, "isolated": isolated,
               "street_ids": sid_of, "split_edges": split_count, "auto_connected": sum(1 for r in node_rep if r["state"] == "connected" and not r.get("manual")),
-              "geometry_edits_lost": lost_geom, "replaced": replaced}
+              "geometry_edits_lost": lost_geom, "replaced": replaced, "node_ids": generated}
     report['uncertain_ends'] = [{'key': f['key'], 'lon': f['coords'][-1][0], 'lat': f['coords'][-1][1]}
                                 for f in features if f.get('end_review') == 'uncertain']
     new_edges = gpd.GeoDataFrame(new_lines, geometry="geometry", crs=crs).to_crs(4326) if new_lines else gpd.GeoDataFrame(

@@ -115,11 +115,22 @@ def test_nothing_is_named_below_an_unnamed_road():
 
 
 def test_display_name_prefers_own_name():
-    """display_name is the own name when present, else the branch name."""
+    """display_name is the own name when present, else the branch name as written (Voie 3 du xyz)."""
     e, s = _network()
     _, out = branches.assign_branch_names(None, e, s)
     d = out.set_index("street_id")["display_name"]
-    assert d[1] == "xyz" and d[6] == "abc" and d[2] == "3-xyz"
+    assert d[1] == "xyz" and d[6] == "abc" and d[2] == "Voie 3 du xyz"
+    assert out.set_index("street_id")["branch_name"][2] == "3-xyz"                  # the internal form is unchanged
+
+
+def test_the_written_name_reads_from_the_main_street_outwards():
+    """Second level: branch 10 of branch 447 is written Voie 447/10; the article follows the root name."""
+    assert branches.written_branch_name("447-", "Boulevard Fo KUETCHONG - KUET") == "Voie 447 du Boulevard Fo KUETCHONG - KUET"
+    assert branches.written_branch_name("10-447-", "Boulevard Fo KUETCHONG") == "Voie 447/10 du Boulevard Fo KUETCHONG"
+    assert branches.written_branch_name("120B-", "Rue de la Chefferie") == "Voie 120B de la Rue de la Chefferie"
+    assert branches.written_branch_name("3-", "Avenue X") == "Voie 3 de l'Avenue X"
+    assert branches.written_branch_name("5-", "Le Marché") == "Voie 5 du Marché"
+    assert branches.written_branch_name("3-", "#512") == "Voie 3 de #512"
 
 
 def test_crowded_slot_gets_letters():
