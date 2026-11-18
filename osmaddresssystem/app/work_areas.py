@@ -87,6 +87,7 @@ def _properties(area_id: str, **extra) -> dict:
 
 
 def make_grid(aoi_wgs84, crs, cell_m: float | str) -> dict:
+    """Square work areas of ``cell_m`` metres covering the boundary; every cell that touches it is kept whole (never clipped)."""
     aoi = gpd.GeoSeries([aoi_wgs84], crs=4326).to_crs(crs).iloc[0]
     x0, y0, x1, y1 = aoi.bounds
     if cell_m == 'auto':
@@ -99,8 +100,8 @@ def make_grid(aoi_wgs84, crs, cell_m: float | str) -> dict:
     cells = []
     for row in range(rows):
         for col in range(cols):
-            shape = box(x0+col*cell_m, y1-(row+1)*cell_m, x0+(col+1)*cell_m, y1-row*cell_m).intersection(aoi)
-            if shape.is_empty or shape.area < 1:
+            shape = box(x0+col*cell_m, y1-(row+1)*cell_m, x0+(col+1)*cell_m, y1-row*cell_m)
+            if shape.intersection(aoi).area < 1:            # keep whole squares: a cell is not cut to the boundary
                 continue
             geom = gpd.GeoSeries([shape], crs=crs).to_crs(4326).iloc[0]
             cells.append({'type': 'Feature', 'properties': _properties(f'R{row+1:02}C{col+1:02}', kind='grid'),

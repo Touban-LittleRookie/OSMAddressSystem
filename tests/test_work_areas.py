@@ -195,3 +195,14 @@ def test_grid_counts_actual_work_areas_not_empty_space_between_them():
     boundary = gpd.GeoSeries([unary_union([box(600000,570000,600400,570400),box(620000,590000,620400,590400)])],crs=32632).to_crs(4326).iloc[0]
     grid = make_grid(boundary,32632,500)
     assert 1 < len(grid['features']) < 10
+
+
+def test_grid_cells_are_whole_squares_even_on_the_boundary():
+    import geopandas as gpd
+    from shapely.geometry import Point, shape
+    from osmaddresssystem.app.work_areas import make_grid
+    boundary = gpd.GeoSeries([Point(600000, 570000).buffer(1200)], crs=32632).to_crs(4326).iloc[0]
+    grid = make_grid(boundary, 32632, 500)
+    cells = gpd.GeoSeries([shape(f['geometry']) for f in grid['features']], crs=4326).to_crs(32632)
+    assert len(cells) > 4
+    assert all(abs(a - 500 ** 2) < 50 for a in cells.area)
