@@ -43,14 +43,15 @@ def test_build_interactive_geocode_map_writes_html(tmp_path):
     assert "__OSM_GEOCODE_MAP_VAR__" not in content
 
 
-def test_build_interactive_geocode_map_uses_google_hybrid_only(tmp_path):
-    """Check build interactive geocode map uses google hybrid only."""
+def test_build_interactive_geocode_map_uses_esri_only(tmp_path):
+    """Check build interactive geocode map uses the default Esri basemap only (no Google imagery)."""
     streets_gdf = _addressed_streets_gdf()
     out_path = str(tmp_path / "geocode.html")
     fmap = geocode_map.build_interactive_geocode_map(streets_gdf, out_path)
 
     content = open(out_path).read()
-    assert "mt1.google.com/vt/lyrs=y" in content
+    assert "wayback.maptiles.arcgis.com" in content
+    assert "google" not in content.lower()
     assert "openstreetmap.org" not in content.lower()
 
     tile_layers = [c for c in fmap._children.values() if c.__class__.__name__ == "TileLayer"]

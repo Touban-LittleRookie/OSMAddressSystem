@@ -469,7 +469,7 @@ def test_background_map_opacity_slider_in_the_layer_control(live_app):
         page.hover(".leaflet-control-layers")                                                  # the control opens on hover
         page.wait_for_selector(".bg-opacity input", state="visible")
         page.evaluate("(() => { const i = document.querySelector('.bg-opacity input'); i.value = 40; i.dispatchEvent(new Event('input', { bubbles: true })); })()")
-        assert page.evaluate("hybrid.options.opacity") == 0.4 and page.evaluate("osmTiles.options.opacity") == 0.4
+        assert page.evaluate("esriSharpTiles.options.opacity") == 0.4 and page.evaluate("osmTiles.options.opacity") == 0.4
         assert "40%" in page.inner_text(".bg-opacity")
     finally:
         browser.close()

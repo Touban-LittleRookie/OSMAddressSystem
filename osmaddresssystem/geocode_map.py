@@ -2,8 +2,8 @@
 
 ``numbering.geocode_points`` answers "what's the address of this point?"
 in Python, against a projected ``streets_gdf``. This module renders the
-same lookup as a single, static HTML page: every street is drawn on a
-Google Hybrid basemap (colored/weighted by its own highway importance
+same lookup as a single, static HTML page: every street is drawn on an
+Esri satellite basemap (colored/weighted by its own highway importance
 tier, labeled with its own name/id), and clicking anywhere computes the
 nearest street, projects the click onto it (marked with a red dot),
 detects which side of the street the click falls on, derives that
@@ -420,7 +420,7 @@ def build_interactive_geocode_map(
 
     Every street in ``streets_gdf`` (one row per street_id, dissolved
     main-path geometry, e.g. from ``pipeline.streets_gdf_from_edges``) is
-    drawn on a Google Hybrid basemap (see ``street_editor._new_map``),
+    drawn on an Esri satellite basemap (see ``street_editor._new_map``),
     colored and weighted by its own ``highway`` value's importance tier
     (``DEFAULT_HIGHWAY_RANKS`` - a motorway draws as a thick red line, a
     footway as a thin gray one, the same convention most street map

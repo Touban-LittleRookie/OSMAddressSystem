@@ -38,10 +38,10 @@ def test_build_street_editor_map_writes_html(tmp_path):
     assert "street_id" in content
 
 
-def test_build_street_editor_map_has_three_switchable_basemaps(tmp_path):
+def test_build_street_editor_map_has_switchable_esri_basemaps(tmp_path):
     """No default OpenStreetMap tiles, and no folium LayerControl radio
     for the basemap (a plain <select> per the caller's own request) -
-    three raster TileLayers (Google Hybrid, Google Satellite, Esri),
+    two raster TileLayers (Esri sharper, Esri), no Google imagery,
     none exposed on the layer control (which only ever lists overlays),
     swapped by osmSetBaseLayer instead."""
     G = build_idealized_grid(rows=2, cols=2, spacing=100.0, named_row=None, primary_row=None)
@@ -52,8 +52,8 @@ def test_build_street_editor_map_has_three_switchable_basemaps(tmp_path):
     fmap = street_editor.build_street_editor_map(streets_gdf, edges_gdf, out_path)
 
     content = open(out_path).read()
-    assert "mt1.google.com/vt/lyrs=y" in content  # Google Hybrid
-    assert "mt1.google.com/vt/lyrs=s" in content  # Google Satellite
+    assert "google" not in content.lower()
+    assert "wayback.maptiles.arcgis.com" in content  # Esri, sharper (default)
     assert "arcgisonline.com" in content  # Esri
     assert "openstreetmap.org" not in content.lower()
     assert "osmSetBaseLayer" in content
@@ -64,7 +64,7 @@ def test_build_street_editor_map_has_three_switchable_basemaps(tmp_path):
     tile_layer_children = [
         c for c in map_children if c.__class__.__name__ == "TileLayer"
     ]
-    assert len(tile_layer_children) == 3
+    assert len(tile_layer_children) == 2
     for layer in tile_layer_children:
         assert layer.overlay is False
         assert layer.control is False

@@ -64,22 +64,23 @@ from .default_values import (
     DEFAULT_TRANSVERSAL_ROAD_PCT,
 )
 
-_GOOGLE_HYBRID_TILE_URL = "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
-_GOOGLE_SATELLITE_TILE_URL = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
+_ESRI_WAYBACK_TILE_URL = (  # Esri Wayback release 49059 (Apr 2026), sharper over Fotouni than the current capture
+    "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/49059/{z}/{y}/{x}"
+)
 _ESRI_SATELLITE_TILE_URL = (
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 )
 
 # name -> (tile URL, attribution, display label for the basemap dropdown).
 _BASEMAPS = {
-    "hybrid": (_GOOGLE_HYBRID_TILE_URL, "Google Hybrid", "Google Hybrid"),
-    "satellite": (_GOOGLE_SATELLITE_TILE_URL, "Google Satellite", "Google Satellite"),
-    "esri": (_ESRI_SATELLITE_TILE_URL, "Esri", "Esri Satellite"),
+    "esri_sharp": (_ESRI_WAYBACK_TILE_URL, "Esri, Maxar, Earthstar Geographics (Wayback 2026-04-30)", "Esri Satellite (sharper)"),
+    "esri": (_ESRI_SATELLITE_TILE_URL, "Esri, Maxar, Earthstar Geographics", "Esri Satellite"),
 }
-_DEFAULT_BASEMAP = "hybrid"
+# No Google imagery: its terms do not allow this use, and geometry traced on it may not go to OSM.
+_DEFAULT_BASEMAP = "esri_sharp"
 
 # 20 mutually distinct, satellite-legible colors (light/saturated enough
-# to read against a dark hybrid basemap). osmColorForStreetId (below)
+# to read against a dark satellite basemap). osmColorForStreetId (below)
 # hashes a street_id into this list - adjacent entries here are chosen
 # to look different from each other, so two street_ids that happen to
 # land next to each other in the list still read as different colors.
@@ -92,10 +93,10 @@ _PALETTE = [
 
 
 def _new_map(location: list[float], zoom_start: int) -> tuple[folium.Map, dict[str, folium.TileLayer]]:
-    """A folium Map with three swappable satellite/hybrid base layers, all
-    at 60% opacity, ``_DEFAULT_BASEMAP`` (Google Hybrid) initially active.
+    """A folium Map with two swappable Esri satellite base layers, both
+    at 60% opacity, ``_DEFAULT_BASEMAP`` (Esri, sharper) initially active.
 
-    No default OpenStreetMap tiles are added (``tiles=None``). All three
+    No default OpenStreetMap tiles are added (``tiles=None``). All
     tile layers are created and added to the map (each gets its own
     Leaflet var, needed for the basemap-select dropdown to swap between
     them by var name), but every non-default one is immediately removed
@@ -103,7 +104,7 @@ def _new_map(location: list[float], zoom_start: int) -> tuple[folium.Map, dict[s
     ``build_street_editor_map`` - only one basemap is ever visible at a
     time, swapped by ``osmSetBaseLayer`` rather than folium's own
     ``LayerControl`` radio buttons (a plain ``<select>`` dropdown per the
-    caller's own request). All three stay off the layer control itself
+    caller's own request). All stay off the layer control itself
     (``control=False``), which only ever lists overlays.
 
     Args:
@@ -1968,8 +1969,8 @@ def build_street_editor_map(
     this for a reviewer who should be able to fix street_id/name/rank
     mistakes but never touch the underlying road network shape.
 
-    The basemap is Google's hybrid (satellite + labels) tile layer at
-    60% opacity, and nothing else, no OpenStreetMap tiles.
+    The basemap is Esri satellite imagery (the sharper Wayback capture by
+    default) at 60% opacity, and nothing else, no OpenStreetMap tiles.
 
     **Default view**: every street drawn thin and muted (grey), so
     nothing dominates the map. An optional "Street labels" overlay
