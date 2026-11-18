@@ -386,3 +386,4 @@ body.locked #workspace-heading { opacity:.85; }
   .workspace-hint { margin-bottom:8px; padding:8px; }
   .reference-logo { width:80px; margin-left:10px; }
 }
+.goto-box input { width:11.5rem; padding:6px 8px; border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-md); font:inherit; font-size:13px; background:#fff; }

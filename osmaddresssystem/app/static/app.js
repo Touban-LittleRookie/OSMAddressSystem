@@ -42,12 +42,37 @@ window.addEventListener('pagehide', saveView);
 const hybrid = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 21, maxNativeZoom: 20, attribution: 'Imagery &copy; Google' }).addTo(map);
 const osmTiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 21, maxNativeZoom: 19, attribution: '&copy; OpenStreetMap' });
 const esriTiles = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 21, maxNativeZoom: 18, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' });
-L.control.layers({ Satellite: hybrid, 'Satellite (Esri)': esriTiles, OpenStreetMap: osmTiles }, {}, { position: 'topleft' }).addTo(map);
+/* Esri Wayback release 49059 (Apr 2026): an older, sharper capture of Fotouni than the current World Imagery */
+const esriSharpTiles = L.tileLayer('https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/49059/{z}/{y}/{x}', { maxZoom: 21, maxNativeZoom: 18, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics (Wayback 2026-04-30)' });
+L.control.layers({ Satellite: hybrid, 'Satellite (Esri)': esriTiles, 'Satellite (Esri, sharper)': esriSharpTiles, OpenStreetMap: osmTiles }, {}, { position: 'topleft' }).addTo(map);
+/* "go to" box: paste "5.33195, 10.22380" (lat, lon; Google Maps order) or "10.22380 5.33195" and press Enter */
+let gotoMark = null;
+const GoTo = L.Control.extend({
+  onAdd() {
+    const box = L.DomUtil.create('form', 'goto-box');
+    box.innerHTML = I18n.html`<input type="text" placeholder="${I18n.t('Go to: lat, lon')}" title="${I18n.t('Paste coordinates such as 5.33195, 10.22380 and press Enter')}">`;
+    L.DomEvent.disableClickPropagation(box); L.DomEvent.disableScrollPropagation(box);
+    box.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const n = (box.firstChild.value.match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
+      if (n.length < 2) { toast(I18n.t('Write two numbers: latitude, longitude'), 4000); return; }
+      let [lat, lon] = n;
+      if (Math.abs(lat) > 9 && Math.abs(lon) < 9) [lat, lon] = [lon, lat];          // Cameroon: lat 2-13, lon 8-16; accept either order
+      if (Math.abs(lat) > 90 || Math.abs(lon) > 180) { toast(I18n.t('Write two numbers: latitude, longitude'), 4000); return; }
+      map.setView([lat, lon], Math.max(map.getZoom(), 18));
+      if (gotoMark) gotoMark.remove();
+      gotoMark = L.circleMarker([lat, lon], { radius: 14, color: '#ff1744', weight: 3, fill: false }).addTo(map);
+      setTimeout(() => { if (gotoMark) { gotoMark.remove(); gotoMark = null; } }, 15000);
+    });
+    return box;
+  },
+});
+new GoTo({ position: 'topleft' }).addTo(map);
 /* opacity slider of the background map inside the layer control */
 (() => {
   const box = document.querySelector('.leaflet-control-layers-list'); if (!box) return;
   let v = 100; try { v = +(localStorage.getItem('addr-bg-opacity') || 100); } catch (e) { /* no storage */ }
-  const apply = (x) => { hybrid.setOpacity(x / 100); esriTiles.setOpacity(x / 100); osmTiles.setOpacity(x / 100); const lbl = box.querySelector('.bg-op-val'); if (lbl) lbl.textContent = `${x}%`; };
+  const apply = (x) => { hybrid.setOpacity(x / 100); esriTiles.setOpacity(x / 100); esriSharpTiles.setOpacity(x / 100); osmTiles.setOpacity(x / 100); const lbl = box.querySelector('.bg-op-val'); if (lbl) lbl.textContent = `${x}%`; };
   const row = document.createElement('div'); row.className = 'bg-opacity';
   row.innerHTML = I18n.html`<label>Background opacity <span class="bg-op-val">${v}%</span></label><input type="range" min="0" max="100" step="5" value="${v}">`;
   box.appendChild(row);
