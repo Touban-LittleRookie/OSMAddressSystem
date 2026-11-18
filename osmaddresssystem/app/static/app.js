@@ -68,6 +68,36 @@ const GoTo = L.Control.extend({
   },
 });
 new GoTo({ position: 'topleft' }).addTo(map);
+/* centre readout: a crosshair marks the map centre; the box shows its work area and coordinates, and copies them
+   (for reports: centre the problem on the crosshair, press Copy, paste) */
+const CentreBox = L.Control.extend({
+  onAdd() {
+    const box = L.DomUtil.create('div', 'centre-box');
+    box.innerHTML = I18n.html`<span class="centre-text"></span><button type="button" class="centre-copy" title="${I18n.t('Copy the work area and coordinates of the map centre')}">${I18n.t('Copy')}</button>`;
+    L.DomEvent.disableClickPropagation(box);
+    box.querySelector('.centre-copy').onclick = async () => {
+      const text = box.querySelector('.centre-text').textContent;
+      try { await navigator.clipboard.writeText(text); toast(I18n.msg`Copied: ${text}`, 3000); } catch (e) { toast(text, 8000); }
+    };
+    return box;
+  },
+});
+new CentreBox({ position: 'bottomleft' }).addTo(map);
+L.DomUtil.create('div', 'centre-cross', map.getContainer());
+function centreAreaId(c) {
+  const hit = (S.project?.work_areas?.features || []).find(f => {
+    const rings = f.geometry.type === 'Polygon' ? [f.geometry.coordinates[0]] : f.geometry.coordinates.map(p => p[0]);
+    return rings.some(r => { const xs = r.map(p => p[0]), ys = r.map(p => p[1]); return c.lng >= Math.min(...xs) && c.lng <= Math.max(...xs) && c.lat >= Math.min(...ys) && c.lat <= Math.max(...ys); });
+  });
+  if (!hit) return '';
+  const n = workAreaNumber(hit.properties.id);
+  return `${n === null ? '' : I18n.msg`area ${n}` + ' '}${hit.properties.id} · `;
+}
+function updateCentreBox() {
+  const el = document.querySelector('.centre-box .centre-text'); if (!el) return;
+  const c = map.getCenter(); el.textContent = `${centreAreaId(c)}${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}`;
+}
+map.on('moveend', updateCentreBox);
 /* opacity slider of the background map inside the layer control */
 (() => {
   const box = document.querySelector('.leaflet-control-layers-list'); if (!box) return;

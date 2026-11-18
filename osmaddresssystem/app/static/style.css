@@ -387,3 +387,7 @@ body.locked #workspace-heading { opacity:.85; }
   .reference-logo { width:80px; margin-left:10px; }
 }
 .goto-box input { width:11.5rem; padding:6px 8px; border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-md); font:inherit; font-size:13px; background:#fff; }
+.centre-box { display:flex; gap:6px; align-items:center; padding:4px 6px; background:#fff; border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-md); font-size:12px; font-variant-numeric:tabular-nums; }
+.centre-box .centre-copy { font:inherit; padding:2px 8px; cursor:pointer; }
+.centre-cross { position:absolute; left:50%; top:50%; width:22px; height:22px; margin:-11px 0 0 -11px; pointer-events:none; z-index:450;
+  background:linear-gradient(#ff1744,#ff1744) center/2px 100% no-repeat, linear-gradient(#ff1744,#ff1744) center/100% 2px no-repeat; opacity:.8; }

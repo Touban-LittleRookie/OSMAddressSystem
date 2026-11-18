@@ -640,3 +640,23 @@ def test_simple_page_redirects_to_the_full_app_when_the_network_has_connection_p
     finally:
         browser.close()
         pw.stop()
+
+
+def test_centre_readout_shows_the_coordinates_of_the_map_centre(live_app):
+    """A crosshair marks the map centre; the readout shows its coordinates (and work area) for reports."""
+    url, root = live_app
+    try:
+        pw = playwright_sync_api.sync_playwright().start()
+        browser = H.launch_browser(pw)
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"no Chromium available: {exc}")
+    try:
+        page = browser.new_page(viewport={"width": 1400, "height": 900})
+        page.goto(url)
+        page.wait_for_selector(".centre-box .centre-copy")
+        assert page.locator(".centre-cross").count() == 1
+        page.evaluate("map.setView([5.3207, 10.2265], 18)")
+        page.wait_for_function("document.querySelector('.centre-box .centre-text').textContent.includes('5.32070, 10.22650')")
+    finally:
+        browser.close()
+        pw.stop()
