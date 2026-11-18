@@ -80,7 +80,7 @@ Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip).
 
 ```bash
 cd code/OSMAddressSystem
-uv sync                                                    # install
+uv sync --extra app --extra planning                           # install (the app and its planning tools)
 uv run python -m osmaddresssystem.app setup --project projects/fotouni    # build the road network from input/
 uv run python -m osmaddresssystem.app account --project projects/fotouni --username admin --name "Administrator"
 uv run python -m osmaddresssystem.app serve --project projects/fotouni --port 8003
