@@ -162,6 +162,7 @@ Browser tests need Playwright and Chrome; they skip when unavailable.
 | Document | What it is for |
 |---|---|
 | `docs/project-status.md` | **Start here**: where the project stands, the agreed rules, the remaining work. |
+| `docs/requirements.md` | Dated record of every requirement and change. |
 | `docs/srs.md` | Software requirements specification. |
 | `docs/system-design.md` | Architecture and target boundary. |
 | `docs/accounts-and-history.md` | Accounts, roles, audit history. |
