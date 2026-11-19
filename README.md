@@ -29,6 +29,7 @@ code once named), house `0230`. Odd numbers are on the left of the street, even 
 10. [Tests](#tests)
 11. [Documentation](#documentation)
 12. [Credits](#credits)
+13. [Licence](#licence)
 
 ---
 
@@ -176,4 +177,7 @@ Browser tests need Playwright and Chrome; they skip when unavailable.
   Cameroon team.
 - Map data © OpenStreetMap contributors (ODbL). Imagery © Esri, Maxar, Earthstar Geographics.
 
-No licence file yet: until one is added, all rights are reserved by the authors.
+## Licence
+
+Open source under the [MIT licence](LICENSE). The street network and naming code was co-developed with a university;
+keeping it open is a requirement.

@@ -56,7 +56,7 @@ accuracy, left as they are.
 8. **OpenStreetMap upload filter**, before any upload. The current `osm_changes.osm` export is not safe to upload as
    it is. It needs: a names-only mode (add names to existing roads); new roads only when drawn on Esri; no
    deletions; no moves that only re-align a road to the imagery. The 24 roads of `input/missing_roads.kml` were
-   drawn in Google Earth and must be redrawn on Esri or left out.
+   drawn in Google Earth; redrawing them on Esri before an upload is optional (decided 19 November 2026).
 9. **Code structure**: `app.js` and `server.py` are long single files; split them by feature without changing
    behaviour, with the test suite passing.
 
@@ -67,4 +67,5 @@ accuracy, left as they are.
 - OpenStreetMap tiles (`tile.openstreetmap.org`): fine for light, internal use with attribution.
 - Leaflet 1.9.4 is bundled in `static/vendor/` with its BSD-2 copyright header.
 - KML import and export is an open file format.
-- The repository has no licence file yet: all rights are reserved by the authors until one is chosen.
+- The code is open source under the **MIT licence** (`LICENSE`): the street network and naming code was
+  co-developed with a university, and keeping it open is a requirement.

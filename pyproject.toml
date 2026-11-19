@@ -3,6 +3,8 @@ name = "osmaddresssystem"
 version = "0.1.0"
 description = "OSM address/street network download and processing tools"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "geopandas",
     "shapely",
