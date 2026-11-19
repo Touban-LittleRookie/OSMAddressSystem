@@ -96,6 +96,13 @@ def test_invited_contributor_and_attributed_history_in_two_browsers(protected_ap
         member.evaluate('api("/project").catch(()=>{})')
         member.locator('#account-login').wait_for()
         assert member.locator('#account-error').inner_text()
+        # Signed in again as a viewer: no editor history, and the editors' data-quality warnings stay hidden.
+        member.locator('#account-username').fill('community')
+        member.locator('#account-password').fill(PASSWORD)
+        member.locator('#account-submit').click()
+        member.wait_for_function('document.querySelector("#account-profile small")?.textContent.includes("Viewer")')
+        assert member.locator('#account-history').count()==0
+        assert not member.locator('#btn-warnings').is_visible() and not member.locator('#warnings-box').is_visible()
         assert errors==[]
         context.close();browser.close()
 

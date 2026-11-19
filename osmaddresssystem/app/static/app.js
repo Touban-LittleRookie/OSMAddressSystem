@@ -395,7 +395,8 @@ function allWarnings() {
   const p = S.project;
   return [...out, ...((S.network && S.network.warnings) || []), ...((S.addresses && S.addresses.warnings) || [])];
 }
-function updateWarnBadge() { const n = allWarnings().length; const c = $('#warn-count'); c.textContent = n; $('#warn-count2').textContent = n; $('#btn-warnings').style.color = n ? 'var(--warn)' : ''; renderWarnings(); }
+function warningsForRole() { const show = !window.AuthUI || AuthUI.can('compute'); $('#btn-warnings').style.display = show ? '' : 'none'; $('#warnings-box').style.display = show ? '' : 'none'; }
+function updateWarnBadge() { warningsForRole(); const n = allWarnings().length; const c = $('#warn-count'); c.textContent = n; $('#warn-count2').textContent = n; $('#btn-warnings').style.color = n ? 'var(--warn)' : ''; renderWarnings(); }
 
 /* ---------------------------------------------------------------- static layers: area, points, reference */
 async function loadStaticLayers() {
@@ -2146,7 +2147,10 @@ async function initApp() {
   if (j.state === 'running') pollJob(j.kind || 'network');
   S.ready = true;
 }
-AuthUI.ready.then(()=>{if(AuthUI.canView())initApp();});
+AuthUI.ready.then(()=>{if(!AuthUI.canView())return;
+  /* the warnings are data-quality checks for the editors; a viewer cannot act on them, so they stay hidden */
+  warningsForRole();
+  initApp();});
 window.addEventListener('authchange',async()=>{
   if(!S.ready) {await initApp();return;}
   await refreshProject();drawTab();
