@@ -25,7 +25,7 @@ STAGE_STATUSES = {
 
 # Approved Fotouni catalogue supplied in ``Overview Abbreviations.xlsx`` on 2 November 2026.
 # The user subsequently confirmed that Balassie is Lassié, so it is deliberately an alias, not a second quartier.
-# Baving (survey spelling) is Mving: confirmed by Boris on 16 November 2026.
+# Baving (survey spelling) is Mving (confirmed 16 November 2026).
 FOTOUNI_QUARTIERS = [
     ('Babong', 'BAB', ['Badong']), ('Badenla', 'BDL', []), ('Balafi', 'BLF', []),
     ('Balatchie', 'BLT', ['Balatchi']), ('Bamendjo', 'BMJ', ['Bamedjo']),

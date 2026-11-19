@@ -121,7 +121,7 @@ Work goes in batches of 7 work areas; an area is complete when its five stages a
 | `projects/fotouni/` | The Fotouni project: `input/` (base data), `network/` (built by `setup`). |
 | `tests/` | pytest suite: synthetic networks, real-data regressions and browser tests (Playwright). |
 | `deploy/` | Docker, docker-compose (SQLite or PostgreSQL, Caddy HTTPS), systemd unit, backup script. |
-| `docs/` | Requirements, specification, system design, accounts, handoffs (see below). |
+| `docs/` | Project status, specification, system design, accounts, deployment (see below). |
 | `examples/`, `experiments/` | Tutorial notebooks and earlier full runs (Bandja, Douala, Fotouni). |
 
 ## Data and privacy
@@ -161,8 +161,7 @@ Browser tests need Playwright and Chrome; they skip when unavailable.
 
 | Document | What it is for |
 |---|---|
-| `docs/handoff-2026-11-18.md` | **Start here**: where the project stands, decisions, the remaining tasks in order. |
-| `docs/requirements.md` | Dated record of every requirement and change. |
+| `docs/project-status.md` | **Start here**: where the project stands, the agreed rules, the remaining work. |
 | `docs/srs.md` | Software requirements specification. |
 | `docs/system-design.md` | Architecture and target boundary. |
 | `docs/accounts-and-history.md` | Accounts, roles, audit history. |
@@ -172,7 +171,7 @@ Browser tests need Playwright and Chrome; they skip when unavailable.
 ## Credits
 
 - `osmaddresssystem` package and the original app: **Miguel Ureña Pliego**.
-- Fotouni pilot, community app work and field review: **Loryan Mbassi (Boris)** and the Community Addressing
+- Fotouni pilot, community app work and field review: **Loryan Mbassi** and the Community Addressing
   Cameroon team.
 - Map data © OpenStreetMap contributors (ODbL). Imagery © Esri, Maxar, Earthstar Geographics.
 

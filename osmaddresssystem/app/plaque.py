@@ -1,6 +1,6 @@
 """House plaques and address cards as SVG, with a QR code drawn here (no imaging or QR library is needed).
 
-The plaque is the format decided on 15 November 2026 (``docs/requirements.md``), on the colours already approved:
+The plaque is the agreed format (``docs/project-status.md``), on the approved colours:
 
 1. at the top, the village and the quartier trigram (``FOTOUNI · TCK``);
 2. the family name of the household, on up to two lines;

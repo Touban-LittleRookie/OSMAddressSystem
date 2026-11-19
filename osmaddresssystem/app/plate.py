@@ -1,4 +1,4 @@
-"""Addresses in the "plaque d'immatriculation" format decided on 15 November 2026 (``docs/requirements.md``).
+"""Addresses in the "plaque d'immatriculation" format agreed for the project (``docs/project-status.md``).
 
 ``TCK 0575 0230`` reads: quartier trigram ``TCK``, street ``0575`` (its number on four digits, or its four-letter code once
 the street has an official name: ``KUET``), house ``0230`` (metres along the street on four digits, even on the right and odd

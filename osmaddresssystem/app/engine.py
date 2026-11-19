@@ -2195,7 +2195,7 @@ def compute_addresses(base: BaseData, state: NetworkState, project: Project) -> 
     (odd on the left, even on the right) is the side of the street the *house* is on. Houses that share a street, side
     and number get a letter (``12A``, ``12B``). A house whose nearest street is a path marked "gives no addresses" takes the
     number of the point where that path (through other such paths) reaches a street that gives addresses, with a letter in
-    walking order from that street (``230A``, ``230B``; see ``docs/requirements.md``, 13 November). The address is ``"<number>, <street name>"`` with the own name, the derived
+    walking order from that street (``230A``, ``230B``; see ``docs/project-status.md``). The address is ``"<number>, <street name>"`` with the own name, the derived
     name (``3-xyz``) or the stand-in ``#id`` while the street still has to be named (status ``pending_name``).
 
     Args:

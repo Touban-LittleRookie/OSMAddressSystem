@@ -137,8 +137,8 @@ Current evidence:
 
 Keep the existing event system as the foundation, but preserve undo/redo and
 restore actions as additional audit records rather than erasing decisions.
-Migrate old anonymous events as **unknown / legacy**. Never assign them to Miguel
-or another person without evidence. No login screen can recover past identity.
+Migrate old anonymous events as **unknown / legacy**. Never assign them to a person
+without evidence. No login screen can recover past identity.
 
 ## Pilot implementation order
 

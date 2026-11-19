@@ -23,5 +23,4 @@ directory has access restrictions, for example:
 ```
 
 Do not reuse an existing project folder as pytest's basetemp: pytest clears it.
-See `../docs/requirements.md` for actual results, outstanding requirements and
-the current next task.
+See `../docs/project-status.md` for the current status and the remaining work.

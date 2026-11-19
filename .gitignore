@@ -30,3 +30,6 @@ projects/*/exports/
 
 # review screenshots and PDFs are shared separately, not versioned
 docs/review/
+
+# internal review material: never versioned
+docs/review/

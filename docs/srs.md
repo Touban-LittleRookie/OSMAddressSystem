@@ -5,7 +5,7 @@ Version 0.1, 15 November 2026. Draft for the project team.
 This document says what the addressing application must do, now for Fotouni and later for other communities, and how it
 should be built. It complements, and does not replace:
 
-- `docs/requirements.md`: the dated record of every requirement and change already implemented;
+- `docs/project-status.md`: where the project stands, the agreed rules and the remaining work;
 - `docs/system-design.md`: the architecture boundary;
 - `docs/deployment-requirements.md`: the hosting brief.
 
@@ -89,7 +89,7 @@ the World Bank guide *Street Addressing and the Management of Cities* (2005) and
 | 20 Jul – 11 Aug | Miguel Ureña Pliego | `OSMAddressSystem` package: street identity from OSM (`street_ids.py`), radial and grid numbering direction, house numbering, geocoding, sign maps. Pipeline runs for Bandja and Douala. |
 | 1 Sep | Miguel | Offline street editor (folium maps) and major street-identity changes. |
 | 25–26 Oct | Miguel | **Major refactor into the community app** (`osmaddresssystem/app`): FastAPI backend, Leaflet front end, project database, path numbering from a reference point, naming plan. Fotouni project inputs imported on 26 October. |
-| 27–29 Oct | Loryan Mbassi ("Boris") | Invited accounts and roles, audit history, design system and logo, English/French interface, road editing tools, street-ID validation, work areas. Pull request #1. |
+| 27–29 Oct | Loryan Mbassi | Invited accounts and roles, audit history, design system and logo, English/French interface, road editing tools, street-ID validation, work areas. Pull request #1. |
 | 29 Oct – 13 Nov | Loryan Mbassi | Naming rules R1–R3, quartier work areas with five-stage progress, drivable/paved per edge, ordered road edits and fast recompute, derived names in walking order, paths that give no addresses, the address register with permanent codes, plaques. |
 
 Branches:
@@ -244,7 +244,7 @@ Branches:
 | NFR-05 | Privacy | No personal data in plaques, public pages, exports to third parties or OSM. Survey personal data stays in its access-controlled folder. |
 | NFR-06 | Stability of identifiers | Street IDs, building IDs and address codes never change silently. Every change is an event with an author. |
 | NFR-07 | Languages | Every screen in French and English. Messages are written for non-specialists. |
-| NFR-08 | Maintainability | Each module has one purpose. Tests exist for each rule; the full suite passes before any release. Decisions are recorded in `docs/requirements.md`. |
+| NFR-08 | Maintainability | Each module has one purpose. Tests exist for each rule; the full suite passes before any release. Agreed rules are recorded in `docs/project-status.md`. |
 | NFR-09 | Portability | Runs on Windows for development and on Linux (Docker) for hosting. Dependencies come from the lockfile. |
 | NFR-10 | Licences | OSM attribution is shown. Imagery used for OSM uploads must be allowed by OSM (section 7.4). |
 
@@ -325,7 +325,7 @@ Move to the target in this order, keeping the same Python rules all along:
 ### 7.5 Development approach
 
 - **Branches:** short feature branches, merged by pull request into `main` after the tests pass. One topic per commit.
-- **Decisions:** every rule decided by the project lead is written in `docs/requirements.md` with its date, then a test,
+- **Decisions:** every agreed rule is written in `docs/project-status.md`, then a test,
   then the code.
 - **Data:** never test on the practice project or production data; always on a copy. Database changes go through
   migrations.

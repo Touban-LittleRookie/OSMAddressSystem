@@ -1,4 +1,4 @@
-# Cloud handoff: preliminary requirements, 2026-10-27
+# Deployment requirements
 
 Scope: hosting the current Fotouni application, not a public production
 deployment or a purchased hosting plan. The pilot date, editor count, public
