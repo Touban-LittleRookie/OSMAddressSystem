@@ -50,10 +50,17 @@ let gotoMark = null;
 const GoTo = L.Control.extend({
   onAdd() {
     const box = L.DomUtil.create('form', 'goto-box');
-    box.innerHTML = I18n.html`<input type="text" placeholder="${I18n.t('Go to: lat, lon')}" title="${I18n.t('Paste coordinates such as 5.33195, 10.22380 and press Enter')}">`;
+    box.innerHTML = I18n.html`<input type="text" placeholder="${I18n.t('Go to: lat, lon')}" title="${I18n.t('Paste coordinates such as 5.33195, 10.22380 and press Enter')}"><div class="goto-area-result" hidden></div>`;
     L.DomEvent.disableClickPropagation(box); L.DomEvent.disableScrollPropagation(box);
     box.addEventListener('submit', (e) => {
       e.preventDefault();
+      const switchButton = e.submitter?.closest('.goto-area-switch');
+      if (switchButton) {
+        chooseWorkArea(switchButton.dataset.area);
+        map.setView([+switchButton.dataset.lat, +switchButton.dataset.lon], Math.max(map.getZoom(), 18), { animate: false });
+        box.querySelector('.goto-area-result').hidden = true;
+        return;
+      }
       const n = (box.firstChild.value.match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
       if (n.length < 2) { toast(I18n.t('Write two numbers: latitude, longitude'), 4000); return; }
       let [lat, lon] = n;
@@ -63,6 +70,18 @@ const GoTo = L.Control.extend({
       if (gotoMark) gotoMark.remove();
       gotoMark = L.circleMarker([lat, lon], { radius: 14, color: '#ff1744', weight: 3, fill: false }).addTo(map);
       setTimeout(() => { if (gotoMark) { gotoMark.remove(); gotoMark = null; } }, 15000);
+      const result = box.querySelector('.goto-area-result'), area = workAreaAt(lat, lon);
+      if (!area) { result.hidden = true; result.replaceChildren(); return; }
+      const ref = workAreaRef(area), same = S.activeArea === area.properties.id && S.areaView === 'work';
+      result.hidden = false;
+      result.innerHTML = `<span>${esc(I18n.msg`This location is in ${ref}.`)}</span>${same ? '' : `<button type="submit" class="goto-area-switch" data-area="${esc(area.properties.id)}" data-lat="${lat}" data-lon="${lon}">${esc(I18n.msg`Switch to ${ref}`)}</button>`}`;
+      const areaButton = result.querySelector('.goto-area-switch');
+      areaButton?.addEventListener('pointerdown', (event) => {
+        event.preventDefault(); event.stopPropagation();
+        chooseWorkArea(areaButton.dataset.area);
+        map.setView([+areaButton.dataset.lat, +areaButton.dataset.lon], Math.max(map.getZoom(), 18), { animate: false });
+        result.hidden = true;
+      }, { once: true });
     });
     return box;
   },
@@ -146,6 +165,23 @@ function highlightQuartiers(ids) {
 function clearQuartierHover() { quartierHoverLayer.clearLayers(); }
 function workAreaNumber(id) { const i = (S.project?.work_areas?.features || []).findIndex(f => f.properties.id === id); return i < 0 ? null : i + 1; }
 function workAreaRef(f) { const n = workAreaNumber(f.properties.id), p = f.properties; return `${n === null ? '' : n + '. '}${p.kind === 'quartier' ? p.name : p.id}`; }
+function pointInRing(lon, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function pointInArea(lon, lat, geometry) {
+  const polygons = geometry?.type === 'Polygon' ? [geometry.coordinates] : geometry?.type === 'MultiPolygon' ? geometry.coordinates : [];
+  return polygons.some(rings => rings.length && pointInRing(lon, lat, rings[0]) && !rings.slice(1).some(ring => pointInRing(lon, lat, ring)));
+}
+function workAreaAt(lat, lon) {
+  const areas = S.project?.work_areas;
+  if (!areas || areas.kind === 'quartiers') return null;
+  return (areas.features || []).find(feature => pointInArea(lon, lat, feature.geometry)) || null;
+}
 function areaStages(p) {
   const result = Object.fromEntries(Object.keys(AREA_STAGES).map(k => [k, 'not_started']));
   if (p.stages) Object.keys(result).forEach(k => { if (p.stages[k]) result[k] = p.stages[k]; });

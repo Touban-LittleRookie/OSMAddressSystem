@@ -6,6 +6,34 @@ from osmaddresssystem.app.store import Store
 import pytest
 
 
+def test_coordinate_search_offers_work_area_switch(live_app):
+    url, root = live_app
+    with playwright_sync_api.sync_playwright() as pw:
+        browser = H.launch_browser(pw)
+        page = browser.new_page(viewport={'width': 1400, 'height': 900})
+        lon, lat = H.lonlat(H.X0 + 120, H.Y0 + 120)
+        assert page.request.post(url + '/api/reference', data={'lat': lat, 'lon': lon}).ok
+        revision = page.request.get(url + '/api/project').json()['status']['revision']
+        assert page.request.post(url + '/api/work-areas/grid', data={'cell_m': 250, 'revision': revision}).ok
+        page.goto(url, wait_until='domcontentloaded')
+        page.wait_for_function('S.ready && S.project.work_areas.features.length > 1')
+        target = page.evaluate('''() => {
+          const f=S.project.work_areas.features[0], ring=f.geometry.coordinates[0];
+          const lon=(Math.min(...ring.map(p=>p[0]))+Math.max(...ring.map(p=>p[0])))/2;
+          const lat=(Math.min(...ring.map(p=>p[1]))+Math.max(...ring.map(p=>p[1])))/2;
+          return {id:f.properties.id,lat,lon};
+        }''')
+        page.locator('.goto-box input').fill(f"{target['lat']}, {target['lon']}")
+        page.locator('.goto-box input').press('Enter')
+        page.locator('.goto-area-result button').wait_for()
+        assert target['id'] in page.locator('.goto-area-result').inner_text()
+        page.locator('.goto-area-result button').click()
+        page.wait_for_function('(id) => S.activeArea === id && S.areaView === "work"', arg=target['id'])
+        centre = page.evaluate('({lat:map.getCenter().lat,lon:map.getCenter().lng})')
+        assert abs(centre['lat'] - target['lat']) < 1e-6 and abs(centre['lon'] - target['lon']) < 1e-6
+        browser.close()
+
+
 def test_connected_trace_uncertainty_areas_and_local_cut(live_app):
     url, root = live_app
     with playwright_sync_api.sync_playwright() as pw:
